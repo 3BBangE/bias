@@ -13,7 +13,7 @@ import numpy as np
 
 
 import streamlit as st
-import FinanceDataReader as fdr
+import finance-datareader as fdr
 import pandas as pd
 import requests
 import plotly.graph_objects as go
@@ -1039,3 +1039,4 @@ with tab_briefing:
                 except Exception as e:
 
                     st.error(f"브리핑 생성 중 오류 발생: {str(e)}")
+
