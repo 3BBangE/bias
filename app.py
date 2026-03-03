@@ -13,7 +13,7 @@ import numpy as np
 
 
 import streamlit as st
-import finance-datareader as fdr
+import FinanceDataReader as fdr
 import pandas as pd
 import requests
 import plotly.graph_objects as go
