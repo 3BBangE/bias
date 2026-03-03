@@ -11,29 +11,6 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 import numpy as np
 
-# SSL 경고 무시 설정
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-# ==========================================
-# [0] 라이브러리 설치 및 초기화
-# ==========================================
-def install_requirements():
-    libraries = [
-        ("streamlit", "streamlit"),
-        ("finance-datareader", "FinanceDataReader"),
-        ("pandas", "pandas"),
-        ("requests", "requests"),
-        ("openai", "openai"),
-        ("plotly", "plotly"),
-        ("certifi", "certifi"),
-        ("scikit-learn", "sklearn"),
-        ("ta", "ta") 
-    ]
-    for package, module in libraries:
-        if importlib.util.find_spec(module) is None:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", package])
-
-install_requirements()
 
 import streamlit as st
 import FinanceDataReader as fdr
@@ -1060,4 +1037,5 @@ with tab_briefing:
                                     st.write(f"**선정 사유:** {stock.get('Reason')}")
                                     
                 except Exception as e:
+
                     st.error(f"브리핑 생성 중 오류 발생: {str(e)}")
