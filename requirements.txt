@@ -1,8 +1,9 @@
 streamlit
-FinanceDataReader
+finance-datareader
 pandas
 requests
 openai
 plotly
 ta
 scikit-learn
+
