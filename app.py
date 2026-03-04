@@ -11,7 +11,6 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 import numpy as np
 
-
 import streamlit as st
 import FinanceDataReader as fdr
 import pandas as pd
@@ -121,10 +120,12 @@ def safe_float(v):
     except: return None
 
 # ==========================================
-# [4] 데이터 수집 엔진
+# [4] 데이터 수집 엔진 (Session State 캐싱 기반)
 # ==========================================
-@st.cache_data(ttl=600)
 def fetch_indices():
+    cache_key = "cache_indices"
+    if cache_key in st.session_state: return st.session_state[cache_key]
+
     res = {"indices": {}}
     idx_map = {"KOSPI": "^KS11", "KOSDAQ": "^KQ11", "NASDAQ": "^IXIC", "S&P 500": "^GSPC"}
     start = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
@@ -141,10 +142,14 @@ def fetch_indices():
             res["indices"][name] = {"price": last, "change": change, "df": close.tail(30)}
         except Exception:
             res["indices"][name] = {"price": 0.0, "change": 0.0, "df": pd.DataFrame(columns=["Close"])}
+            
+    st.session_state[cache_key] = res
     return res
 
-@st.cache_data(ttl=600)
 def fetch_fred_series(series_id: str, years: int = 5) -> pd.DataFrame:
+    cache_key = f"cache_fred_{series_id}_{years}"
+    if cache_key in st.session_state: return st.session_state[cache_key]
+
     start_date = (datetime.now() - timedelta(days=365 * years)).strftime("%Y-%m-%d")
     try:
         df = fdr.DataReader(f"FRED:{series_id}", start_date)
@@ -154,28 +159,32 @@ def fetch_fred_series(series_id: str, years: int = 5) -> pd.DataFrame:
         df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
         df[series_id] = pd.to_numeric(df[series_id], errors="coerce")
         df = df.dropna(subset=["DATE"]).sort_values("DATE")
+        st.session_state[cache_key] = df
         return df
     except:
         return pd.DataFrame(columns=["DATE", series_id])
 
-@st.cache_data(ttl=3600)
 def fetch_put_call_ratio() -> float:
-    # 1. CNN Fear & Greed 내부 데이터에서 실시간 PCR 스크래핑 시도
+    cache_key = "cache_pcr"
+    if cache_key in st.session_state: return st.session_state[cache_key]
+
     url = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json", "Origin": "https://edition.cnn.com", "Referer": "https://edition.cnn.com/"}
     try:
         r = requests.get(url, headers=headers, timeout=10, verify=False)
         data = r.json()
-        return float(data['put_call_options']['data'][-1]['y'])
+        result = float(data['put_call_options']['data'][-1]['y'])
     except:
-        # 2. 실패 시, PCR과 80% 이상 강한 양의 상관관계를 가지는 VIX를 활용해 PCR 추정치 강제 산출 (UI 에러 방지)
         try:
             vix_df = fdr.DataReader("FRED:VIXCLS", (datetime.now() - timedelta(days=15)).strftime("%Y-%m-%d"))
             latest_vix = float(vix_df.iloc[-1, 0])
             proxy_pcr = 0.7 + ((latest_vix - 15) / 20) * 0.5
-            return round(max(0.5, min(proxy_pcr, 1.5)), 2)
+            result = round(max(0.5, min(proxy_pcr, 1.5)), 2)
         except:
-            return 0.95
+            result = 0.95
+            
+    st.session_state[cache_key] = result
+    return result
 
 def summarize_fred_latest(df: pd.DataFrame, series_id: str):
     if df is None or df.empty: return {"latest": None, "mom_change": None, "yoy_change": None}
@@ -191,8 +200,10 @@ def summarize_fred_latest(df: pd.DataFrame, series_id: str):
     except: pass
     return {"latest": latest, "mom_change": mom, "yoy_change": yoy}
 
-@st.cache_data(ttl=3600)
 def fetch_dix_gex() -> pd.DataFrame:
+    cache_key = "cache_dix"
+    if cache_key in st.session_state: return st.session_state[cache_key]
+
     url = "https://squeezemetrics.com/monitor/static/DIX.csv"
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
@@ -200,15 +211,18 @@ def fetch_dix_gex() -> pd.DataFrame:
         if r.status_code != 200: return pd.DataFrame()
         df = pd.read_csv(io.StringIO(r.text))
         df['date'] = pd.to_datetime(df['date'])
-        return df.sort_values('date')
+        result = df.sort_values('date')
     except:
-        return pd.DataFrame()
+        result = pd.DataFrame()
+        
+    st.session_state[cache_key] = result
+    return result
 
-@st.cache_data(ttl=600)
 def fetch_cnn_fear_and_greed():
+    cache_key = "cache_cnn_fg"
+    if cache_key in st.session_state: return st.session_state[cache_key]
+
     url = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
-    
-    # 실제 최신 크롬 브라우저와 동일한 헤더로 위장 (Anti-Bot 우회용)
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
@@ -230,12 +244,17 @@ def fetch_cnn_fear_and_greed():
         score = data['fear_and_greed']['score']
         rating = data['fear_and_greed']['rating']
         rating_ko = {"extreme fear": "극단적 공포", "fear": "공포", "neutral": "중립", "greed": "탐욕", "extreme greed": "극단적 탐욕"}.get(rating.lower(), rating)
-        return {"score": round(score), "rating": rating_ko, "error": None}
+        result = {"score": round(score), "rating": rating_ko, "error": None}
     except Exception as e:
-        return {"score": None, "rating": None, "error": str(e)}
+        result = {"score": None, "rating": None, "error": str(e)}
+        
+    st.session_state[cache_key] = result
+    return result
 
-@st.cache_data(ttl=600)
 def fetch_naver_news_bulk(query: str, client_id: str, client_secret: str, display: int = 100):
+    cache_key = f"cache_news_bulk_{query}_{display}"
+    if cache_key in st.session_state: return st.session_state[cache_key]
+
     if not client_id or client_id == "YOUR_NAVER_ID": return {"items": [], "error": "NAVER API 설정 오류"}
     url = "https://openapi.naver.com/v1/search/news.json"
     headers = {"X-Naver-Client-Id": client_id, "X-Naver-Client-Secret": client_secret}
@@ -243,10 +262,15 @@ def fetch_naver_news_bulk(query: str, client_id: str, client_secret: str, displa
     r = requests.get(url, headers=headers, params=params, timeout=15, verify=False)
     if r.status_code != 200: return {"items": [], "error": f"API 오류: {r.status_code}"}
     data = r.json()
-    return {"items": [{"title": strip_html(it.get("title")), "description": strip_html(it.get("description")), "link": it.get("link")} for it in data.get("items", [])], "error": None}
+    result = {"items": [{"title": strip_html(it.get("title")), "description": strip_html(it.get("description")), "link": it.get("link")} for it in data.get("items", [])], "error": None}
+    
+    st.session_state[cache_key] = result
+    return result
 
-@st.cache_data(ttl=600)
 def fetch_naver_news_500(query: str, client_id: str, client_secret: str):
+    cache_key = f"cache_news_500_{query}"
+    if cache_key in st.session_state: return st.session_state[cache_key]
+
     if not client_id or client_id == "YOUR_NAVER_ID": return {"items": [], "error": "NAVER API 설정 오류"}
     url = "https://openapi.naver.com/v1/search/news.json"
     headers = {"X-Naver-Client-Id": client_id, "X-Naver-Client-Secret": client_secret}
@@ -269,10 +293,15 @@ def fetch_naver_news_500(query: str, client_id: str, client_secret: str):
             pass
         time.sleep(0.1)
     if not all_items: return {"items": [], "error": "뉴스 데이터 수집 실패"}
-    return {"items": all_items, "error": None}
+    result = {"items": all_items, "error": None}
+    
+    st.session_state[cache_key] = result
+    return result
 
-@st.cache_data(ttl=3600)
 def fetch_corporate_keywords(tickers: list, api_key: str):
+    cache_key = f"cache_corp_kw_{'-'.join(tickers[:3])}"
+    if cache_key in st.session_state: return st.session_state[cache_key]
+
     if not api_key or api_key == "YOUR_FINNHUB_API_KEY": return {"error": "Finnhub API 설정 오류."}
     end_date = datetime.now().strftime("%Y-%m-%d")
     start_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
@@ -292,10 +321,15 @@ def fetch_corporate_keywords(tickers: list, api_key: str):
                         if word in text: counts[word] += 1
         except: pass
         time.sleep(0.5)
-    return {"error": None, "counts": counts, "keywords": keywords}
+    result = {"error": None, "counts": counts, "keywords": keywords}
+    
+    st.session_state[cache_key] = result
+    return result
 
-@st.cache_data(ttl=86400)
 def get_dart_corp_master(api_key: str) -> pd.DataFrame:
+    cache_key = "cache_dart_master"
+    if cache_key in st.session_state: return st.session_state[cache_key]
+
     if not api_key or api_key == "YOUR_DART_API_KEY": return pd.DataFrame(columns=['corp_name', 'stock_code', 'corp_code'])
     url = f"https://opendart.fss.or.kr/api/corpCode.xml?crtfc_key={api_key}"
     try:
@@ -305,9 +339,12 @@ def get_dart_corp_master(api_key: str) -> pd.DataFrame:
             with z.open('CORPCODE.xml') as f:
                 tree = ET.parse(f)
                 data = [{'corp_name': lt.find('corp_name').text, 'stock_code': lt.find('stock_code').text.strip(), 'corp_code': lt.find('corp_code').text} for lt in tree.getroot().findall('list') if lt.find('stock_code').text and lt.find('stock_code').text.strip() != ""]
-                return pd.DataFrame(data)
+                result = pd.DataFrame(data)
+                st.session_state[cache_key] = result
+                return result
     except: return pd.DataFrame(columns=['corp_name', 'stock_code', 'corp_code'])
-    # ==========================================
+
+# ==========================================
 # [5] 융합 스코어링 및 백테스트 엔진
 # ==========================================
 def detect_ml_anomalies(df: pd.DataFrame, value_col: str) -> bool:
@@ -354,8 +391,10 @@ def run_quick_backtest(df: pd.DataFrame) -> dict:
     except:
         return {"win_rate": 0.0, "avg_return": 0.0, "total_trades": 0}
 
-@st.cache_data(ttl=3600)
 def process_insider_us(ticker: str, fear_greed_score: int, api_key: str):
+    cache_key = f"cache_insider_us_{ticker}"
+    if cache_key in st.session_state: return st.session_state[cache_key]
+
     if not api_key or api_key == "YOUR_FINNHUB_API_KEY": return {"error": "Finnhub API 설정 오류."}
     headers = {"X-Finnhub-Token": api_key}
     url = f"https://finnhub.io/api/v1/stock/insider-transactions?symbol={ticker}"
@@ -382,11 +421,15 @@ def process_insider_us(ticker: str, fear_greed_score: int, api_key: str):
             prof_r = requests.get(f"https://finnhub.io/api/v1/stock/profile2?symbol={ticker}", headers=headers, timeout=5)
             if prof_r.status_code == 200: sector = prof_r.json().get('finnhubIndustry', 'Unknown')
         except: pass
-        return {"error": None, "net_weighted_buy_90d": net_buy, "unique_buyers_30d": buyers_30d, "is_cluster_buying": bool(buyers_30d >= 3), "ml_anomaly_detected": ml_anomaly, "sector": sector, "market": "US"}
+        result = {"error": None, "net_weighted_buy_90d": net_buy, "unique_buyers_30d": buyers_30d, "is_cluster_buying": bool(buyers_30d >= 3), "ml_anomaly_detected": ml_anomaly, "sector": sector, "market": "US"}
+        st.session_state[cache_key] = result
+        return result
     except Exception as e: return {"error": str(e)}
 
-@st.cache_data(ttl=3600)
 def process_insider_kr(ticker: str, api_key: str):
+    cache_key = f"cache_insider_kr_{ticker}"
+    if cache_key in st.session_state: return st.session_state[cache_key]
+
     if not api_key or api_key == "YOUR_DART_API_KEY": return {"error": "DART API 설정 오류."}
     df_master = get_dart_corp_master(api_key)
     match = df_master[df_master['stock_code'] == ticker]
@@ -407,7 +450,9 @@ def process_insider_kr(ticker: str, api_key: str):
         df_90d = df[df['rcept_dt'] >= datetime.now() - pd.Timedelta(days=90)]
         df_30d = df[df['rcept_dt'] >= datetime.now() - pd.Timedelta(days=30)]
         ml_anomaly = bool(detect_ml_anomalies(df, 'change_qty'))
-        return {"error": None, "net_weighted_buy_90d": float(df_90d['change_qty'].sum()), "unique_buyers_30d": int(df_30d['repror'].nunique()), "is_cluster_buying": bool(int(df_30d['repror'].nunique()) >= 3), "ml_anomaly_detected": ml_anomaly, "sector": KR_SECTORS.get(ticker, "Unknown"), "market": "KR"}
+        result = {"error": None, "net_weighted_buy_90d": float(df_90d['change_qty'].sum()), "unique_buyers_30d": int(df_30d['repror'].nunique()), "is_cluster_buying": bool(int(df_30d['repror'].nunique()) >= 3), "ml_anomaly_detected": ml_anomaly, "sector": KR_SECTORS.get(ticker, "Unknown"), "market": "KR"}
+        st.session_state[cache_key] = result
+        return result
     except Exception as e: return {"error": str(e)}
 
 def run_fused_batch_scan(us_tickers: list, kr_tickers: list, fear_score: int) -> dict:
@@ -427,13 +472,47 @@ def run_fused_batch_scan(us_tickers: list, kr_tickers: list, fear_score: int) ->
     return {"stock_signals": signals, "hot_sectors": [s for s, count in sector_counts.items() if count >= 3]}
 
 # ==========================================
-# [6] AI 분석 엔진
+# [6] AI 분석 엔진 및 RAG 파이프라인
 # ==========================================
+def get_top_k_news_rag(client: OpenAI, query: str, news_items: list, k: int = 20) -> list:
+    if not news_items: return []
+    if len(news_items) <= k: return news_items
+    
+    try:
+        # 1. 쿼리 벡터화
+        query_res = client.embeddings.create(input=query, model="text-embedding-3-small")
+        query_vec = np.array(query_res.data[0].embedding)
+        
+        # 2. 뉴스 데이터 벡터화
+        texts = []
+        for item in news_items:
+            title = item.get("title", "")
+            desc = item.get("description", "")
+            texts.append(f"{title} {desc}")
+            
+        news_res = client.embeddings.create(input=texts, model="text-embedding-3-small")
+        news_vecs = np.array([data.embedding for data in news_res.data])
+        
+        # 3. 코사인 유사도 산출
+        norms_news = np.linalg.norm(news_vecs, axis=1)
+        norm_query = np.linalg.norm(query_vec)
+        similarities = np.dot(news_vecs, query_vec) / (norms_news * norm_query)
+        
+        # 4. 상위 k개 인덱스 추출
+        top_k_idx = similarities.argsort()[-k:][::-1]
+        return [news_items[i] for i in top_k_idx]
+    except Exception:
+        # API 오류 등 예외 발생 시 단순 슬라이싱으로 폴백(Fallback) 방어
+        return news_items[:k]
+
 def analyze_news_with_gpt(client: OpenAI, news_items: list):
+    context_query = "글로벌 거시 경제 흐름, 시장 침체, 실적 발표, 금리 동향 등 주요 시장 테마"
+    top_news = get_top_k_news_rag(client, context_query, news_items, k=20)
+    
     prompt = """시장 심리 분석 AI임. 반드시 JSON 형식 응답.
 [JSON Schema]
 {"Sentiment_Score": 0~100, "Market_Mood": "안정/주의/경고", "Key_Themes": ["키워드1"], "Summary": "요약", "Hot_Stocks": [{"Name": "종목", "Ticker": "티커", "Reason": "근거", "News_Link": "URL"}]}"""
-    res = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "system", "content": prompt}, {"role": "user", "content": f"데이터: {json.dumps(news_items[:100], ensure_ascii=False)}"}], response_format={"type": "json_object"})
+    res = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "system", "content": prompt}, {"role": "user", "content": f"데이터: {json.dumps(top_news, ensure_ascii=False)}"}], response_format={"type": "json_object"})
     return json.loads(res.choices[0].message.content)
 
 def run_main_reco_engine(client: OpenAI, indices_data: dict, active_exotics: list, fred_snapshot: dict, vix_snapshot: dict, fg_snapshot: dict, dix_snapshot: dict, news_snapshot: dict, fused_signals: dict, nlp_snapshot: dict):
@@ -455,7 +534,11 @@ def generate_market_briefing(client: OpenAI, market: str, session: str, news_ite
     prompt = f"""데이터 기반 퀀트 애널리스트임. 시장 '{market}', 시점 '{session}'. 10개 종목 꽉 채울 것.
 [JSON Schema]
 {{ "Overview": "시장 분위기 요약", "Top_3_News": [ {{"Title": "뉴스", "Link": "URL"}} ], "Watchlist": [ {{ "Name": "종목명", "Ticker": "티커", "Reason": "사유" }} ] }}"""
-    optimized_news = [{"Title": item["title"], "Link": item["link"]} for item in news_items[:300]]
+    
+    context_query = f"{market} {session} 시황, 특징주, 거시 경제 및 금리 동향"
+    top_news = get_top_k_news_rag(client, context_query, news_items, k=20)
+    optimized_news = [{"Title": item.get("title"), "Link": item.get("link")} for item in top_news]
+    
     res = client.chat.completions.create(model="gpt-4o", messages=[{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps({"Macro": macro_snap, "News": optimized_news}, ensure_ascii=False)}], response_format={"type": "json_object"})
     return json.loads(res.choices[0].message.content)
 
@@ -469,21 +552,29 @@ def generate_swing_scenarios(client: OpenAI, ticker: str, current_price: float, 
   "Plan_A": { "Strategy": "돌파 매수", "Condition": "진입조건", "Entry_Price": 0.0, "Target_Price": 0.0, "Stop_Loss": 0.0, "Risk_Reward_Ratio": "1:X", "Reason": "논리" },
   "Plan_B": { "Strategy": "눌림목 매수", "Condition": "진입조건", "Entry_Price": 0.0, "Target_Price": 0.0, "Stop_Loss": 0.0, "Risk_Reward_Ratio": "1:X", "Reason": "논리" }
 }"""
-    payload = {"Ticker": ticker, "Current_Price": current_price, "Technical_Indicators": tech_summary, "Recent_News": news_data[:10]}
+    
+    context_query = f"{ticker} 주가 전망, 실적 발표, 호재, 악재, 목표가"
+    top_news = get_top_k_news_rag(client, context_query, news_data, k=10)
+    
+    payload = {"Ticker": ticker, "Current_Price": current_price, "Technical_Indicators": tech_summary, "Recent_News": top_news}
     res = client.chat.completions.create(model="gpt-4o", messages=[{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}], response_format={"type": "json_object"})
     return json.loads(res.choices[0].message.content)
 
 # ==========================================
 # [7] 재무 데이터 보강 및 스윙 지표 계산 함수
 # ==========================================
-@st.cache_data(ttl=3600)
 def fetch_finnhub_fundamentals(ticker: str, api_key: str):
+    cache_key = f"cache_fundamentals_{ticker}"
+    if cache_key in st.session_state: return st.session_state[cache_key]
+
     if not api_key or api_key == "YOUR_FINNHUB_API_KEY": return {"error": "API 미설정"}
     try:
         r = requests.get(f"https://finnhub.io/api/v1/stock/metric?symbol={ticker}&metric=all", headers={"X-Finnhub-Token": api_key}, timeout=10)
         m = r.json().get("metric", {})
         if not m: raise ValueError("데이터 없음")
-        return {"error": None, "metrics": {"PE": m.get("peBasicExclExtraTTM"), "RG": m.get("revenueGrowthTTMYoy"), "DE": m.get("longTermDebt/equityAnnual")}}
+        result = {"error": None, "metrics": {"PE": m.get("peBasicExclExtraTTM"), "RG": m.get("revenueGrowthTTMYoy"), "DE": m.get("longTermDebt/equityAnnual")}}
+        st.session_state[cache_key] = result
+        return result
     except: return {"error": "데이터 부족함"}
 
 def format_financial_summary(ticker: str, mode: str = "top") -> str:
@@ -500,8 +591,10 @@ def enrich_report_with_fundamentals(report: dict):
         for s in report.get(k, []): s["Financial_Summary"] = format_financial_summary(str(s.get("Ticker", "")).strip(), mode=mode)
     return report
 
-@st.cache_data(ttl=3600)
 def fetch_ohlcv(ticker: str, days: int = 180) -> pd.DataFrame:
+    cache_key = f"cache_ohlcv_{ticker}_{days}"
+    if cache_key in st.session_state: return st.session_state[cache_key]
+
     start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
     try:
         df = fdr.DataReader(ticker, start_date)
@@ -509,6 +602,7 @@ def fetch_ohlcv(ticker: str, days: int = 180) -> pd.DataFrame:
         df = df.reset_index()
         df.rename(columns={df.columns[0]: 'Date'}, inplace=True)
         df.columns = [col.capitalize() if col.lower() != 'date' else 'Date' for col in df.columns]
+        st.session_state[cache_key] = df
         return df
     except:
         return pd.DataFrame()
@@ -539,6 +633,12 @@ def calculate_technicals(df: pd.DataFrame) -> pd.DataFrame:
 st.set_page_config(page_title="Project B.I.A.S v4.0 (Full Edition)", layout="wide")
 
 with st.sidebar:
+    if st.button("🔄 실시간 데이터 새로고침", use_container_width=True, type="primary"):
+        for key in list(st.session_state.keys()):
+            if key.startswith("cache_"):
+                del st.session_state[key]
+        st.rerun()
+
     st.header("⚙️ SYSTEM CONFIG")
     use_news = st.checkbox("실시간 뉴스 여론 반영", value=True)
     st.caption("ㄴ 경제 뉴스 100건을 수집하여 AI가 탐욕/공포 심리를 분석함.")
@@ -1037,6 +1137,4 @@ with tab_briefing:
                                     st.write(f"**선정 사유:** {stock.get('Reason')}")
                                     
                 except Exception as e:
-
                     st.error(f"브리핑 생성 중 오류 발생: {str(e)}")
-
