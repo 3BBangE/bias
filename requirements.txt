@@ -6,4 +6,5 @@ openai
 plotly
 ta
 scikit-learn
-
+vectorbt
+quantstats
