@@ -9,3 +9,4 @@ scikit-learn
 vectorbt
 quantstats
 statsmodels
+ecos
