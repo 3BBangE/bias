@@ -21,6 +21,14 @@ import plotly.io as pio
 from openai import OpenAI
 from sklearn.ensemble import IsolationForest
 import ta
+import vectorbt as vbt
+import quantstats as qs
+from statsmodels.tsa.stattools import grangercausalitytests, adfuller
+from statsmodels.tsa.api import VAR
+import warnings
+from PublicDataReader import Ecos
+
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 pio.templates.default = "plotly_dark"
 
@@ -33,6 +41,7 @@ try:
     NAVER_CLIENT_SECRET = st.secrets["NAVER_CLIENT_SECRET"]
     FINNHUB_API_KEY = st.secrets["FINNHUB_API_KEY"]
     DART_API_KEY = st.secrets["DART_API_KEY"]
+    ECOS_API_KEY = st.secrets["ECOS_API_KEY"]
 except Exception as e:
     st.error("Secrets 설정 오류: Streamlit Cloud 관리자 페이지에서 API 키를 등록해야 함.")
     st.stop()
@@ -101,6 +110,35 @@ FRED_DESC = {
     "GSCPI": "글로벌 공급망 병목 현상 및 원가 상승 압력 측정.",
     "PFOODINDEXM": "IMF 산출 글로벌 식량 가격 지수."
 }
+
+ECOS_SERIES = {
+    "금리(Interest)": {
+        "한은 기준금리": {"stat_code": "722Y001", "item_code": "0101000", "cycle": "M"},
+        "국고채 3년": {"stat_code": "817Y002", "item_code": "010200000", "cycle": "D"},
+    },
+    "물가(Price)": {
+        "소비자물가지수 (CPI)": {"stat_code": "901Y009", "item_code": "0", "cycle": "M"},
+        "생산자물가지수 (PPI)": {"stat_code": "404Y014", "item_code": "0", "cycle": "M"},
+    },
+    "통화(Money)": {
+        "M2 광의통화 (평잔)": {"stat_code": "101Y003", "item_code": "BBHS00", "cycle": "M"},
+    },
+    "실물(Real)": {
+        "경상수지": {"stat_code": "301Y013", "item_code": "000000", "cycle": "M"},
+        "산업생산지수": {"stat_code": "901Y033", "item_code": "I11AA", "cycle": "M"},
+    }
+}
+
+ECOS_DESC = {
+    "한은 기준금리": "한국은행 금융통화위원회가 결정하는 정책 기준금리. FRED의 FFR에 대응.",
+    "국고채 3년": "한국 국채 3년물 수익률. 시장 금리 및 채권 시장 방향성 지표.",
+    "소비자물가지수 (CPI)": "한국 도시 소비자 물가 변동. FRED의 CPIAUCSL에 대응.",
+    "생산자물가지수 (PPI)": "생산자 단계 원가 변동. 소비자물가 선행 지표.",
+    "M2 광의통화 (평잔)": "한국 시중 유동성 총량. FRED의 WM2NS에 대응.",
+    "경상수지": "수출입 및 소득수지 합산. 흑자 지속은 원화 강세 요인.",
+    "산업생산지수": "광공업 생산량 지표. FRED의 INDPRO에 대응.",
+}
+
 # ==========================================
 # [3] 공통 유틸리티 함수
 # ==========================================
@@ -163,6 +201,74 @@ def fetch_fred_series(series_id: str, years: int = 5) -> pd.DataFrame:
         return df
     except:
         return pd.DataFrame(columns=["DATE", series_id])
+
+def fetch_ecos_series(stat_code: str, item_code: str, cycle: str = "M", years: int = 5) -> pd.DataFrame:
+    cache_key = f"cache_ecos_{stat_code}_{item_code}_{years}"
+    if cache_key in st.session_state:
+        return st.session_state[cache_key]
+
+    try:
+        api = Ecos(ECOS_API_KEY)
+
+        if cycle == "D":
+            start_date = (datetime.now() - timedelta(days=365 * years)).strftime("%Y%m%d")
+            end_date = datetime.now().strftime("%Y%m%d")
+        else:
+            start_date = (datetime.now() - timedelta(days=365 * years)).strftime("%Y%m")
+            end_date = datetime.now().strftime("%Y%m")
+
+        df = api.get_statistic_search(
+            통계표코드=stat_code,
+            주기=cycle,
+            검색시작일자=start_date,
+            검색종료일자=end_date,
+            통계항목코드1=item_code
+        )
+
+        if df is None or df.empty:
+            return pd.DataFrame(columns=["DATE", "VALUE"])
+
+        df = df[["시점", "값"]].copy()
+        df.columns = ["DATE", "VALUE"]
+
+        if cycle == "D":
+            df["DATE"] = pd.to_datetime(df["DATE"], format="%Y%m%d", errors="coerce")
+        else:
+            df["DATE"] = pd.to_datetime(df["DATE"], format="%Y%m", errors="coerce")
+
+        df["VALUE"] = pd.to_numeric(df["VALUE"], errors="coerce")
+        df = df.dropna(subset=["DATE"]).sort_values("DATE")
+
+        st.session_state[cache_key] = df
+        return df
+
+    except Exception:
+        return pd.DataFrame(columns=["DATE", "VALUE"])
+
+def summarize_ecos_latest(df: pd.DataFrame) -> dict:
+    """ECOS 시계열의 최신값, MoM 변화, YoY 변화를 요약."""
+    if df is None or df.empty:
+        return {"latest": None, "mom_change": None, "yoy_change": None}
+
+    s = df.set_index("DATE")["VALUE"].dropna()
+    if s.empty:
+        return {"latest": None, "mom_change": None, "yoy_change": None}
+
+    latest = safe_float(s.iloc[-1])
+    mom, yoy = None, None
+
+    try:
+        m_idx = s.loc[:s.index[-1] - pd.Timedelta(days=30)]
+        y_idx = s.loc[:s.index[-1] - pd.Timedelta(days=365)]
+        if not m_idx.empty:
+            mom = round(latest - safe_float(m_idx.iloc[-1]), 4)
+        if not y_idx.empty:
+            yoy = round(latest - safe_float(y_idx.iloc[-1]), 4)
+    except:
+        pass
+
+    return {"latest": latest, "mom_change": mom, "yoy_change": yoy}
+
 
 def fetch_put_call_ratio() -> float:
     cache_key = "cache_pcr"
@@ -344,6 +450,445 @@ def get_dart_corp_master(api_key: str) -> pd.DataFrame:
                 return result
     except: return pd.DataFrame(columns=['corp_name', 'stock_code', 'corp_code'])
 
+def compute_macro_regime() -> dict:
+    """
+    핵심 FRED 지표들을 종합하여 현재 매크로 레짐을 정량 판별.
+    Returns:
+        regime: "Risk-On" / "Neutral" / "Risk-Off"
+        score: 0~100 (100 = 완전 Risk-On)
+        signals: 개별 지표 판정 결과 dict
+        summary: AI 프롬프트에 주입할 한 줄 요약 문자열
+    """
+    cache_key = "cache_macro_regime"
+    if cache_key in st.session_state:
+        return st.session_state[cache_key]
+
+    signals = {}
+    score_components = []
+
+    # 1) 장단기 금리차 (T10Y2Y) — 역전 여부
+    try:
+        df_t10 = fetch_fred_series("T10Y2Y", years=3)
+        if not df_t10.empty:
+            latest = float(df_t10["T10Y2Y"].iloc[-1])
+            prev_6m = df_t10["T10Y2Y"].iloc[-130] if len(df_t10) >= 130 else df_t10["T10Y2Y"].iloc[0]
+            prev_6m = float(prev_6m)
+
+            if latest < 0:
+                sig = "역전 지속 (침체 경고)"
+                pts = 10
+            elif latest > 0 and prev_6m < 0:
+                sig = "역전→정상 전환 (최대 위험 구간)"
+                pts = 20
+            elif latest > 0.5:
+                sig = "정상 스프레드 (안정)"
+                pts = 80
+            else:
+                sig = "정상 범위 (주의)"
+                pts = 55
+
+            signals["T10Y2Y"] = {"value": round(latest, 3), "signal": sig}
+            score_components.append(pts)
+    except:
+        pass
+
+    # 2) 금융스트레스지수 (STLFSI4) — 0 기준
+    try:
+        df_st = fetch_fred_series("STLFSI4", years=2)
+        if not df_st.empty:
+            latest = float(df_st["STLFSI4"].iloc[-1])
+            if latest > 1.0:
+                sig, pts = "높은 스트레스 (경고)", 15
+            elif latest > 0:
+                sig, pts = "스트레스 상승 중 (주의)", 40
+            elif latest > -0.5:
+                sig, pts = "정상 범위", 65
+            else:
+                sig, pts = "매우 안정적", 85
+
+            signals["STLFSI4"] = {"value": round(latest, 3), "signal": sig}
+            score_components.append(pts)
+    except:
+        pass
+
+    # 3) 삼 법칙 (SAHMREALTIME) — 0.5 기준
+    try:
+        df_sahm = fetch_fred_series("SAHMREALTIME", years=2)
+        if not df_sahm.empty:
+            latest = float(df_sahm["SAHMREALTIME"].iloc[-1])
+            if latest >= 0.5:
+                sig, pts = "침체 진입 판별 (Sahm Rule 발동)", 10
+            elif latest >= 0.3:
+                sig, pts = "침체 접근 중 (경계)", 35
+            else:
+                sig, pts = "안전 범위", 80
+
+            signals["SAHMREALTIME"] = {"value": round(latest, 3), "signal": sig}
+            score_components.append(pts)
+    except:
+        pass
+
+    # 4) 하이일드 스프레드 (BAMLH0A0HYM2) — 신용 리스크
+    try:
+        df_hy = fetch_fred_series("BAMLH0A0HYM2", years=2)
+        if not df_hy.empty:
+            latest = float(df_hy["BAMLH0A0HYM2"].iloc[-1])
+            if latest > 5.0:
+                sig, pts = "신용 경색 위험 (부도율 급등 구간)", 15
+            elif latest > 4.0:
+                sig, pts = "스프레드 확대 (주의)", 40
+            elif latest > 3.0:
+                sig, pts = "정상 범위", 65
+            else:
+                sig, pts = "매우 안정적 (리스크 선호)", 85
+
+            signals["BAMLH0A0HYM2"] = {"value": round(latest, 3), "signal": sig}
+            score_components.append(pts)
+    except:
+        pass
+
+    # 5) M2 통화량 증감률 (WM2NS) — 유동성 방향
+    try:
+        df_m2 = fetch_fred_series("WM2NS", years=3)
+        if not df_m2.empty and len(df_m2) >= 13:
+            latest = float(df_m2["WM2NS"].iloc[-1])
+            yr_ago = float(df_m2["WM2NS"].iloc[-13])  # 약 12개월 전 (월간 데이터)
+            yoy_pct = ((latest - yr_ago) / yr_ago) * 100
+
+            if yoy_pct > 5:
+                sig, pts = f"유동성 확장 (+{yoy_pct:.1f}% YoY)", 80
+            elif yoy_pct > 0:
+                sig, pts = f"완만한 확장 (+{yoy_pct:.1f}% YoY)", 60
+            else:
+                sig, pts = f"유동성 수축 ({yoy_pct:.1f}% YoY)", 25
+
+            signals["M2_YoY"] = {"value": round(yoy_pct, 2), "signal": sig}
+            score_components.append(pts)
+    except:
+        pass
+
+    # 종합 스코어
+    if score_components:
+        total_score = int(round(sum(score_components) / len(score_components)))
+    else:
+        total_score = 50
+
+    if total_score >= 65:
+        regime = "Risk-On"
+    elif total_score >= 40:
+        regime = "Neutral"
+    else:
+        regime = "Risk-Off"
+
+    # AI 프롬프트 주입용 요약 문자열
+    sig_lines = [f"  - {k}: {v['value']} → {v['signal']}" for k, v in signals.items()]
+    summary = f"매크로 레짐: {regime} (점수 {total_score}/100)\n" + "\n".join(sig_lines)
+
+    result = {
+        "regime": regime,
+        "score": total_score,
+        "signals": signals,
+        "summary": summary
+    }
+    st.session_state[cache_key] = result
+    return result
+
+def compute_kr_macro_regime() -> dict:
+    """
+    한국 핵심 매크로 지표를 종합하여 한국 시장 레짐을 판별.
+    compute_macro_regime()의 한국 대응 버전.
+    """
+    cache_key = "cache_kr_macro_regime"
+    if cache_key in st.session_state:
+        return st.session_state[cache_key]
+
+    signals = {}
+    score_components = []
+
+    # 1) 한은 기준금리 — 방향성 (인하 추세 = Risk-On)
+    try:
+        df_rate = fetch_ecos_series("722Y001", "0101000", "M", years=3)
+        if not df_rate.empty and len(df_rate) >= 3:
+            latest = float(df_rate["VALUE"].iloc[-1])
+            prev_3m = float(df_rate["VALUE"].iloc[-4]) if len(df_rate) >= 4 else latest
+            diff = latest - prev_3m
+
+            if diff < -0.25:
+                sig, pts = f"금리 인하 추세 ({latest}% → 3개월 전 대비 {diff:+.2f}%p)", 80
+            elif diff > 0.25:
+                sig, pts = f"금리 인상 추세 ({latest}% → 3개월 전 대비 {diff:+.2f}%p)", 30
+            else:
+                sig, pts = f"금리 동결 ({latest}%)", 55
+
+            signals["기준금리"] = {"value": latest, "signal": sig}
+            score_components.append(pts)
+    except:
+        pass
+
+    # 2) CPI YoY — 물가 안정 여부
+    try:
+        df_cpi = fetch_ecos_series("901Y009", "0", "M", years=3)
+        if not df_cpi.empty and len(df_cpi) >= 13:
+            latest = float(df_cpi["VALUE"].iloc[-1])
+            yr_ago = float(df_cpi["VALUE"].iloc[-13])
+            yoy_pct = ((latest - yr_ago) / yr_ago) * 100
+
+            if yoy_pct > 4.0:
+                sig, pts = f"물가 불안 (YoY +{yoy_pct:.1f}%)", 25
+            elif yoy_pct > 2.5:
+                sig, pts = f"물가 주의 (YoY +{yoy_pct:.1f}%)", 50
+            else:
+                sig, pts = f"물가 안정 (YoY +{yoy_pct:.1f}%)", 80
+
+            signals["CPI_YoY"] = {"value": round(yoy_pct, 2), "signal": sig}
+            score_components.append(pts)
+    except:
+        pass
+
+    # 3) M2 통화량 증감률 — 유동성
+    try:
+        df_m2 = fetch_ecos_series("101Y003", "BBHS00", "M", years=3)
+        if not df_m2.empty and len(df_m2) >= 13:
+            latest = float(df_m2["VALUE"].iloc[-1])
+            yr_ago = float(df_m2["VALUE"].iloc[-13])
+            yoy_pct = ((latest - yr_ago) / yr_ago) * 100
+
+            if yoy_pct > 6:
+                sig, pts = f"유동성 확장 (YoY +{yoy_pct:.1f}%)", 80
+            elif yoy_pct > 2:
+                sig, pts = f"완만한 확장 (YoY +{yoy_pct:.1f}%)", 60
+            else:
+                sig, pts = f"유동성 긴축 (YoY +{yoy_pct:.1f}%)", 30
+
+            signals["M2_YoY_KR"] = {"value": round(yoy_pct, 2), "signal": sig}
+            score_components.append(pts)
+    except:
+        pass
+
+    # 4) 경상수지 — 3개월 추세
+    try:
+        df_ca = fetch_ecos_series("301Y013", "000000", "M", years=2)
+        if not df_ca.empty and len(df_ca) >= 3:
+            recent_3m = df_ca["VALUE"].tail(3).mean()
+            if recent_3m > 3000:
+                sig, pts = f"경상수지 대폭 흑자 (3M 평균 {recent_3m:,.0f}백만$)", 85
+            elif recent_3m > 0:
+                sig, pts = f"경상수지 흑자 (3M 평균 {recent_3m:,.0f}백만$)", 65
+            else:
+                sig, pts = f"경상수지 적자 (3M 평균 {recent_3m:,.0f}백만$)", 25
+
+            signals["경상수지"] = {"value": round(float(recent_3m), 0), "signal": sig}
+            score_components.append(pts)
+    except:
+        pass
+
+    # 5) 산업생산지수 — MoM 방향
+    try:
+        df_ip = fetch_ecos_series("901Y033", "I11AA", "M", years=2)
+        if not df_ip.empty and len(df_ip) >= 2:
+            latest = float(df_ip["VALUE"].iloc[-1])
+            prev = float(df_ip["VALUE"].iloc[-2])
+            mom_pct = ((latest - prev) / prev) * 100
+
+            if mom_pct > 1.0:
+                sig, pts = f"생산 증가 (MoM +{mom_pct:.1f}%)", 75
+            elif mom_pct > -1.0:
+                sig, pts = f"생산 보합 (MoM {mom_pct:+.1f}%)", 55
+            else:
+                sig, pts = f"생산 위축 (MoM {mom_pct:.1f}%)", 30
+
+            signals["산업생산"] = {"value": round(latest, 1), "signal": sig}
+            score_components.append(pts)
+    except:
+        pass
+
+    # 종합
+    if score_components:
+        total_score = int(round(sum(score_components) / len(score_components)))
+    else:
+        total_score = 50
+
+    if total_score >= 65:
+        regime = "Risk-On"
+    elif total_score >= 40:
+        regime = "Neutral"
+    else:
+        regime = "Risk-Off"
+
+    sig_lines = [f"  - {k}: {v['value']} → {v['signal']}" for k, v in signals.items()]
+    summary = f"한국 매크로 레짐: {regime} (점수 {total_score}/100)\n" + "\n".join(sig_lines)
+
+    result = {
+        "regime": regime,
+        "score": total_score,
+        "signals": signals,
+        "summary": summary
+    }
+    st.session_state[cache_key] = result
+    return result
+
+def compute_dual_macro_comparison() -> dict:
+    """
+    미국(FRED)과 한국(ECOS) 매크로 레짐을 비교 분석하여
+    크로스마켓 전략 시그널을 산출.
+    """
+    cache_key = "cache_dual_macro"
+    if cache_key in st.session_state:
+        return st.session_state[cache_key]
+
+    us_regime = compute_macro_regime()
+    kr_regime = compute_kr_macro_regime()
+
+    us_score = us_regime["score"]
+    kr_score = kr_regime["score"]
+    gap = us_score - kr_score
+
+    # 크로스마켓 시그널 판별
+    if gap > 20:
+        cross_signal = "미국 우위 — US 자산 비중 확대 권고"
+    elif gap < -20:
+        cross_signal = "한국 우위 — KR 자산 비중 확대 권고"
+    else:
+        cross_signal = "균형 — 한미 균등 배분 유지"
+
+    # 금리 디커플링 체크
+    rate_note = ""
+    try:
+        # 미국: T10Y2Y
+        df_us_rate = fetch_fred_series("T10Y2Y", years=1)
+        # 한국: 국고채 3년
+        df_kr_rate = fetch_ecos_series("817Y002", "010200000", "D", years=1)
+
+        if not df_us_rate.empty and not df_kr_rate.empty:
+            us_spread = float(df_us_rate["T10Y2Y"].iloc[-1])
+            kr_rate = float(df_kr_rate["VALUE"].iloc[-1])
+            rate_note = f"미국 장단기 금리차: {us_spread:.2f}%p | 한국 국고채3년: {kr_rate:.2f}%"
+    except:
+        pass
+
+    result = {
+        "us_regime": us_regime["regime"],
+        "us_score": us_score,
+        "kr_regime": kr_regime["regime"],
+        "kr_score": kr_score,
+        "gap": gap,
+        "cross_signal": cross_signal,
+        "rate_note": rate_note,
+        "us_signals": us_regime["signals"],
+        "kr_signals": kr_regime["signals"]
+    }
+    st.session_state[cache_key] = result
+    return result
+
+# ── [C-2] 그레인저 인과관계 검정 ──
+def run_granger_causality(macro_series_id: str, market_symbol: str = "^GSPC",
+                          max_lag: int = 6, significance: float = 0.05) -> dict:
+    """
+    FRED 매크로 지표 → 시장 지수(S&P500 등)의 그레인저 인과관계 검정.
+    월간 데이터 기준 lag 1~6개월 테스트.
+    Returns:
+        has_causality: bool
+        best_lag: 최적 시차 (개월)
+        p_value: 최적 시차의 p-value
+        direction: "매크로→시장" 등
+    """
+    DEFAULT = {"has_causality": False, "best_lag": 0, "p_value": 1.0, "direction": "N/A", "error": None}
+
+    try:
+        # 매크로 데이터 (월간)
+        df_macro = fetch_fred_series(macro_series_id, years=10)
+        if df_macro.empty or len(df_macro) < 36:
+            return {**DEFAULT, "error": "매크로 데이터 부족"}
+
+        df_macro = df_macro.set_index("DATE").resample("ME").last().dropna()
+
+        # 시장 데이터
+        start = (datetime.now() - timedelta(days=365 * 10)).strftime("%Y-%m-%d")
+        df_market = fdr.DataReader(market_symbol, start)
+        if df_market is None or df_market.empty:
+            return {**DEFAULT, "error": "시장 데이터 수집 실패"}
+
+        df_market = df_market[["Close"]].resample("ME").last().dropna()
+        df_market["Market_Return"] = df_market["Close"].pct_change()
+
+        # 병합 및 정렬
+        merged = pd.merge(
+            df_macro.rename(columns={macro_series_id: "Macro"}),
+            df_market[["Market_Return"]],
+            left_index=True, right_index=True, how="inner"
+        ).dropna()
+
+        if len(merged) < max_lag + 10:
+            return {**DEFAULT, "error": "병합 데이터 부족"}
+
+        # 정상성 확인 (ADF) — 비정상이면 차분
+        for col in ["Macro", "Market_Return"]:
+            adf_p = adfuller(merged[col].dropna(), autolag="AIC")[1]
+            if adf_p > 0.05:
+                merged[col] = merged[col].diff()
+        merged = merged.dropna()
+
+        if len(merged) < max_lag + 5:
+            return {**DEFAULT, "error": "차분 후 데이터 부족"}
+
+        # 그레인저 검정: Macro → Market_Return
+        test_result = grangercausalitytests(
+            merged[["Market_Return", "Macro"]].values,
+            maxlag=max_lag, verbose=False
+        )
+
+        best_lag, best_p = 0, 1.0
+        for lag in range(1, max_lag + 1):
+            p_val = test_result[lag][0]['ssr_ftest'][1]
+            if p_val < best_p:
+                best_p = p_val
+                best_lag = lag
+
+        return {
+            "has_causality": best_p < significance,
+            "best_lag": best_lag,
+            "p_value": round(best_p, 4),
+            "direction": f"{macro_series_id} → 시장수익률 ({best_lag}개월 선행)",
+            "error": None
+        }
+    except Exception as e:
+        return {**DEFAULT, "error": str(e)}
+
+
+# ── [C-3] 레짐별 전략 가중치 산출 ──
+def get_regime_strategy_weights(regime_result: dict) -> dict:
+    """
+    매크로 레짐 판별 결과를 기반으로 전략 파라미터 가중치를 반환.
+    스윙 전략, 포지션 사이징, 리스크 한도에 연결.
+    """
+    regime = regime_result.get("regime", "Neutral")
+    score = regime_result.get("score", 50)
+
+    if regime == "Risk-On":
+        return {
+            "position_size_multiplier": 1.2,    # 포지션 20% 확대
+            "stop_loss_atr_multiplier": 2.0,    # 스탑 여유 확대
+            "max_risk_pct": 3.0,                # 최대 리스크 3%
+            "strategy_bias": "공격적 돌파 매수 선호",
+            "regime_note": f"매크로 환경 양호 (점수 {score}/100). 유동성과 신용 여건이 뒷받침하므로 공격적 포지셔닝 가능."
+        }
+    elif regime == "Risk-Off":
+        return {
+            "position_size_multiplier": 0.6,    # 포지션 40% 축소
+            "stop_loss_atr_multiplier": 1.2,    # 타이트한 스탑
+            "max_risk_pct": 1.0,                # 최대 리스크 1%
+            "strategy_bias": "현금 비중 확대, 보수적 눌림목만 선별",
+            "regime_note": f"매크로 경고 (점수 {score}/100). 침체 시그널 감지. 포지션 축소 및 방어적 운용 필수."
+        }
+    else:
+        return {
+            "position_size_multiplier": 1.0,
+            "stop_loss_atr_multiplier": 1.5,
+            "max_risk_pct": 2.0,
+            "strategy_bias": "중립 — 양방향 시나리오 준비",
+            "regime_note": f"매크로 중립 (점수 {score}/100). 혼조 시그널. 기본 리스크 관리 유지."
+        }
+
 # ==========================================
 # [5] 융합 스코어링 및 백테스트 엔진
 # ==========================================
@@ -357,40 +902,144 @@ def detect_ml_anomalies(df: pd.DataFrame, value_col: str) -> bool:
         return bool((recent_trade['anomaly'] == -1) and (recent_trade[value_col] > df[value_col].mean()))
     except: return False
 
-def run_quick_backtest(df: pd.DataFrame) -> dict:
+def run_quick_backtest(df: pd.DataFrame, rsi_entry: int = 35, rsi_exit: int = 65, fee_pct: float = 0.001) -> dict:
+    """
+    vectorbt 기반 백테스팅 엔진.
+    - RSI 기반 진입/청산 + 수수료/슬리피지 반영
+    - Sharpe, MDD, Profit Factor 등 프로덕션급 메트릭 산출
+    - equity_curve 반환 (차트용)
+    """
+    DEFAULT_RESULT = {
+        "win_rate": 0.0, "avg_return": 0.0, "total_trades": 0,
+        "sharpe_ratio": 0.0, "max_drawdown": 0.0, "total_return": 0.0,
+        "avg_win": 0.0, "avg_loss": 0.0, "profit_factor": 0.0,
+        "equity_curve": pd.Series(dtype=float)
+    }
+
     try:
         if 'RSI' not in df.columns or len(df) < 30:
-            return {"win_rate": 0.0, "avg_return": 0.0, "total_trades": 0}
-            
-        df_bt = df[['Close', 'RSI']].copy()
-        df_bt['Signal'] = 0
-        
-        # 표본 확대를 위해 진입 조건을 RSI 35, 청산 조건을 RSI 65로 소폭 완화
-        df_bt.loc[df_bt['RSI'] < 35, 'Signal'] = 1  
-        df_bt.loc[df_bt['RSI'] > 65, 'Signal'] = -1 
-        
-        trades = []
-        entry_price = 0
-        
-        for idx, row in df_bt.iterrows():
-            if row['Signal'] == 1 and entry_price == 0:
-                entry_price = row['Close']
-            elif row['Signal'] == -1 and entry_price > 0:
-                exit_price = row['Close']
-                trades.append((exit_price - entry_price) / entry_price * 100)
-                entry_price = 0
-                
-        if not trades:
-            return {"win_rate": 0.0, "avg_return": 0.0, "total_trades": 0}
-            
-        winning_trades = [t for t in trades if t > 0]
-        win_rate = (len(winning_trades) / len(trades)) * 100
-        avg_return = sum(trades) / len(trades)
-        
-        return {"win_rate": float(win_rate), "avg_return": float(avg_return), "total_trades": len(trades)}
-    except:
-        return {"win_rate": 0.0, "avg_return": 0.0, "total_trades": 0}
+            return DEFAULT_RESULT
 
+        close = df['Close'].values
+        rsi = df['RSI'].values
+
+        # 시그널 생성
+        entries = pd.Series(rsi < rsi_entry, index=df.index)
+        exits = pd.Series(rsi > rsi_exit, index=df.index)
+
+        # vectorbt 포트폴리오 시뮬레이션
+        pf = vbt.Portfolio.from_signals(
+            close=pd.Series(close, index=df.index),
+            entries=entries,
+            exits=exits,
+            fees=fee_pct,        # 수수료 0.1%
+            slippage=0.001,      # 슬리피지 0.1%
+            init_cash=10000,
+            freq='1D'
+        )
+
+        trades = pf.trades
+        total_trades = trades.count()
+
+        if total_trades == 0:
+            return DEFAULT_RESULT
+
+        win_rate = float(trades.win_rate() * 100)
+        sharpe = float(pf.sharpe_ratio()) if not np.isnan(pf.sharpe_ratio()) else 0.0
+        max_dd = float(pf.max_drawdown()) if not np.isnan(pf.max_drawdown()) else 0.0
+        total_ret = float(pf.total_return()) if not np.isnan(pf.total_return()) else 0.0
+
+        # avg win / avg loss
+        avg_win = float(trades.winning.avg().get('PnL', 0)) if hasattr(trades, 'winning') else 0.0
+        avg_loss = float(trades.losing.avg().get('PnL', 0)) if hasattr(trades, 'losing') else 0.0
+
+        # profit factor 안전 계산
+        try:
+            win_sum = float(trades.winning.sum().get('PnL', 0)) if hasattr(trades, 'winning') else 0.0
+            loss_sum = abs(float(trades.losing.sum().get('PnL', 0))) if hasattr(trades, 'losing') else 0.0
+            profit_factor = round(win_sum / loss_sum, 2) if loss_sum > 0 else 0.0
+        except:
+            profit_factor = 0.0
+
+        # equity curve
+        equity_curve = pf.value()
+
+        return {
+            "win_rate": round(win_rate, 1),
+            "avg_return": round(total_ret * 100, 2),
+            "total_trades": int(total_trades),
+            "sharpe_ratio": round(sharpe, 2),
+            "max_drawdown": round(max_dd * 100, 2),
+            "total_return": round(total_ret * 100, 2),
+            "avg_win": round(avg_win, 2),
+            "avg_loss": round(avg_loss, 2),
+            "profit_factor": profit_factor,
+            "equity_curve": equity_curve
+        }
+    except Exception:
+        return DEFAULT_RESULT
+
+def run_rsi_grid_search(df: pd.DataFrame, fee_pct: float = 0.001) -> dict:
+    """
+    RSI 진입/청산 임계값 조합을 그리드 서치하여 최적 파라미터를 탐색.
+    결과를 히트맵 데이터로 반환.
+    """
+    DEFAULT_GRID = {"best_entry": 35, "best_exit": 65, "best_sharpe": 0.0, "heatmap_df": pd.DataFrame()}
+
+    try:
+        if 'RSI' not in df.columns or len(df) < 60:
+            return DEFAULT_GRID
+
+        close = pd.Series(df['Close'].values, index=df.index)
+        rsi = df['RSI'].values
+
+        entry_range = range(20, 42, 3)    # 20, 23, 26, 29, 32, 35, 38, 41
+        exit_range = range(58, 81, 3)     # 58, 61, 64, 67, 70, 73, 76, 79
+
+        results = []
+
+        for e_val in entry_range:
+            for x_val in exit_range:
+                entries = pd.Series(rsi < e_val, index=df.index)
+                exits = pd.Series(rsi > x_val, index=df.index)
+
+                pf = vbt.Portfolio.from_signals(
+                    close=close, entries=entries, exits=exits,
+                    fees=fee_pct, slippage=0.001, init_cash=10000, freq='1D'
+                )
+
+                sr = pf.sharpe_ratio()
+                sr = float(sr) if not np.isnan(sr) else 0.0
+                tc = pf.trades.count()
+
+                results.append({
+                    "RSI_Entry": e_val,
+                    "RSI_Exit": x_val,
+                    "Sharpe": round(sr, 2),
+                    "Trades": int(tc)
+                })
+
+        results_df = pd.DataFrame(results)
+
+        # 최소 5회 이상 트레이드 발생한 조합만 유효
+        valid = results_df[results_df['Trades'] >= 5]
+        if valid.empty:
+            return DEFAULT_GRID
+
+        best = valid.loc[valid['Sharpe'].idxmax()]
+
+        # 히트맵용 피벗 테이블
+        heatmap_df = results_df.pivot(index='RSI_Entry', columns='RSI_Exit', values='Sharpe')
+
+        return {
+            "best_entry": int(best['RSI_Entry']),
+            "best_exit": int(best['RSI_Exit']),
+            "best_sharpe": float(best['Sharpe']),
+            "heatmap_df": heatmap_df
+        }
+    except Exception:
+        return DEFAULT_GRID
+    
 def process_insider_us(ticker: str, fear_greed_score: int, api_key: str):
     cache_key = f"cache_insider_us_{ticker}"
     if cache_key in st.session_state: return st.session_state[cache_key]
@@ -515,18 +1164,45 @@ def analyze_news_with_gpt(client: OpenAI, news_items: list):
     res = client.chat.completions.create(model="gpt-5.4", messages=[{"role": "system", "content": prompt}, {"role": "user", "content": f"데이터: {json.dumps(top_news, ensure_ascii=False)}"}], response_format={"type": "json_object"})
     return json.loads(res.choices[0].message.content)
 
-def run_main_reco_engine(client: OpenAI, indices_data: dict, active_exotics: list, fred_snapshot: dict, vix_snapshot: dict, fg_snapshot: dict, dix_snapshot: dict, news_snapshot: dict, fused_signals: dict, nlp_snapshot: dict):
+def run_main_reco_engine(client, indices_data: dict, active_exotics: list,
+                         fred_snapshot: dict, vix_snapshot: dict, fg_snapshot: dict,
+                         dix_snapshot: dict, news_snapshot: dict, fused_signals: dict,
+                         nlp_snapshot: dict, macro_regime_snapshot: dict = None,
+                         ecos_snapshot: dict = None, kr_regime_snapshot: dict = None,
+                         dual_macro_snapshot: dict = None):
+
     indices_brief = {k: {"price": v["price"], "change": v["change"]} for k, v in indices_data.get("indices", {}).items()}
+
     prompt = """냉철한 데이터 분석가 AI임. 반드시 JSON 형식 응답.
-지수, 거시, 뉴스 심리, DIX, 기업 텍스트 마이닝 종합.
+지수, 거시(미국 FRED + 한국 ECOS), 뉴스 심리, DIX, 기업 텍스트 마이닝, 백테스트 성과 지표, 한미 듀얼 매크로 레짐 판별 결과 종합.
 
 [강제 지시 사항]
 1. 'Top_Stocks'와 'Avoid_Stocks' 배열에는 각각 반드시 5개의 종목을 꽉 채워야 함.
 2. 수집된 뉴스나 데이터에 추천/기피 종목이 부족하다면, 현재 시장의 주요 테마나 거시 지표 흐름을 대변하는 대형 우량주(S&P500 등)를 임의로라도 포함시켜서 무조건 5개를 산출할 것.
+3. fused_signals에 백테스트 메트릭(Sharpe, MDD, Profit Factor)이 포함된 경우, 해당 수치를 종목 추천/기피의 정량적 근거로 활용할 것.
+4. macro_regime 데이터가 제공된 경우:
+   - "Risk-Off" 레짐이면 Stability_Score를 40 이하로 산정하고, 방어주/현금 비중 확대를 Strategy에 반드시 포함.
+   - "Risk-On" 레짐이면 성장주/모멘텀 전략 비중을 높이되, 과열 경고가 있으면 함께 언급.
+   - 개별 signals (T10Y2Y, STLFSI4, SAHMREALTIME 등)의 구체적 수치와 판정을 Logic에 인용할 것.
+5. dual_macro 데이터가 제공된 경우:
+   - 한미 레짐 괴리(gap)가 20점 이상이면 우위 시장을 명시하고 자산 배분 편향을 Strategy에 반영할 것.
+   - 한국 ECOS 지표(기준금리, CPI, M2, 경상수지, 산업생산)의 구체적 수치를 Logic에 인용할 것.
+   - 한국 주식 추천/기피 시 한국 매크로 레짐을 근거로 사용할 것.
 
 [JSON Schema]
-{ "Logic": "분석 근거", "Stability_Score": 0~100, "Strategy": "투자 전략", "Top_Stocks": [{ "Name": "종목", "Ticker": "티커", "Reason": "추천사유", "Score": 80, "Financial_Summary": "AUTO" }], "Avoid_Stocks": [{ "Name": "종목", "Ticker": "티커", "Reason": "기피사유", "Score": 20, "Financial_Summary": "AUTO" }] }"""
-    payload = {"indices": indices_brief, "exotics": active_exotics, "fred": fred_snapshot, "vix": vix_snapshot, "cnn_fg": fg_snapshot, "dix_gex": dix_snapshot, "news": news_snapshot, "fused_signals": fused_signals, "nlp": nlp_snapshot}
+{ "Logic": "분석 근거 (한미 듀얼 매크로 레짐 판정 포함)", "Stability_Score": 0~100, "Strategy": "투자 전략 (한미 레짐 기반 자산 배분 반영)", "Top_Stocks": [{ "Name": "종목", "Ticker": "티커", "Reason": "추천사유", "Score": 80, "Financial_Summary": "AUTO" }], "Avoid_Stocks": [{ "Name": "종목", "Ticker": "티커", "Reason": "기피사유", "Score": 20, "Financial_Summary": "AUTO" }] }"""
+
+    payload = {
+        "indices": indices_brief, "exotics": active_exotics,
+        "fred": fred_snapshot, "vix": vix_snapshot,
+        "cnn_fg": fg_snapshot, "dix_gex": dix_snapshot,
+        "news": news_snapshot, "fused_signals": fused_signals,
+        "nlp": nlp_snapshot,
+        "macro_regime": macro_regime_snapshot if macro_regime_snapshot else {},
+        "ecos": ecos_snapshot if ecos_snapshot else {},
+        "kr_macro_regime": kr_regime_snapshot if kr_regime_snapshot else {},
+        "dual_macro": dual_macro_snapshot if dual_macro_snapshot else {}
+    }
     res = client.chat.completions.create(model="gpt-5.4", messages=[{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}], response_format={"type": "json_object"})
     return json.loads(res.choices[0].message.content)
 
@@ -544,21 +1220,198 @@ def generate_market_briefing(client: OpenAI, market: str, session: str, news_ite
 
 def generate_swing_scenarios(client: OpenAI, ticker: str, current_price: float, tech_summary: dict, news_data: list):
     prompt = """당신은 퀀트 기반 스윙 트레이딩 시스템임.
-제공된 기술적 지표, 백테스트 승률, Put/Call 비율(1.2 이상 시 공포 극단으로 인한 반전 매수 트리거)을 분석하여 구체적 매매 시나리오 산출.
-반드시 JSON 형식으로만 응답하며, 구체적인 가격 수치를 포함해야 함.
+제공된 기술적 지표, 백테스트 결과(Sharpe Ratio, MDD, Profit Factor 포함), Put/Call 비율(1.2 이상 시 공포 극단으로 인한 반전 매수 트리거), 매크로 레짐 판별 결과를 분석하여 구체적 매매 시나리오 산출.
+
+[중요 지침]
+- Sharpe Ratio가 1.0 이상이면 해당 전략의 과거 성과가 양호한 것이므로 신뢰도를 높여 반영할 것.
+- Max Drawdown이 -30% 이하이면 리스크 관리 강화를 시나리오에 반영할 것.
+- Profit Factor가 1.5 미만이면 보수적 포지션 사이즈를 권고할 것.
+- Macro_Regime이 "Risk-Off"이면 Plan A/B 모두 보수적 목표가와 타이트한 손절가를 산출할 것.
+- Macro_Regime이 "Risk-On"이면 목표가를 상향 조정하고, R:R 비율을 1:2.5 이상으로 확대할 것.
+- Macro_Strategy_Note 내용을 Analysis에 반드시 인용할 것.
+- 반드시 JSON 형식으로만 응답하며, 구체적인 가격 수치를 포함해야 함.
+
 [JSON Schema]
 {
-  "Analysis": "지표, 백테스트 결과, PCR을 융합한 진단",
+  "Analysis": "지표, 백테스트 결과(Sharpe/MDD/PF), PCR, 매크로 레짐을 융합한 진단",
   "Plan_A": { "Strategy": "돌파 매수", "Condition": "진입조건", "Entry_Price": 0.0, "Target_Price": 0.0, "Stop_Loss": 0.0, "Risk_Reward_Ratio": "1:X", "Reason": "논리" },
   "Plan_B": { "Strategy": "눌림목 매수", "Condition": "진입조건", "Entry_Price": 0.0, "Target_Price": 0.0, "Stop_Loss": 0.0, "Risk_Reward_Ratio": "1:X", "Reason": "논리" }
 }"""
-    
+
     context_query = f"{ticker} 주가 전망, 실적 발표, 호재, 악재, 목표가"
     top_news = get_top_k_news_rag(client, context_query, news_data, k=10)
-    
+
     payload = {"Ticker": ticker, "Current_Price": current_price, "Technical_Indicators": tech_summary, "Recent_News": top_news}
     res = client.chat.completions.create(model="gpt-5.4", messages=[{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}], response_format={"type": "json_object"})
     return json.loads(res.choices[0].message.content)
+
+def validate_gpt_price(label: str, price: float, current_price: float, atr: float,
+                       max_atr_multiple: float = 5.0) -> dict:
+    """
+    GPT가 산출한 개별 가격의 합리성을 ATR 기반으로 검증.
+
+    Args:
+        label: 가격 종류 ("Entry", "Target", "Stop_Loss")
+        price: GPT 산출 가격
+        current_price: 현재 시장가
+        atr: 14일 ATR
+        max_atr_multiple: 현재가 대비 허용 최대 ATR 배수 (기본 5배)
+
+    Returns:
+        {
+            "valid": bool,
+            "original": float,
+            "corrected": float or None,
+            "warning": str or None,
+            "deviation_atr": float  (현재가 대비 몇 ATR 차이인지)
+        }
+    """
+    if price is None or price <= 0 or atr is None or atr <= 0:
+        return {
+            "valid": False,
+            "original": price,
+            "corrected": None,
+            "warning": f"{label}: 유효하지 않은 가격 (${price})",
+            "deviation_atr": 0.0
+        }
+
+    deviation = abs(price - current_price)
+    deviation_atr = round(deviation / atr, 1)
+
+    # 검증 1: 현재가 대비 ATR 배수 초과 여부
+    if deviation_atr > max_atr_multiple:
+        # 보정: max_atr_multiple 범위 내로 클램핑
+        if price > current_price:
+            corrected = round(current_price + (atr * max_atr_multiple), 2)
+        else:
+            corrected = round(current_price - (atr * max_atr_multiple), 2)
+
+        return {
+            "valid": False,
+            "original": price,
+            "corrected": corrected,
+            "warning": f"{label}: GPT 산출가 ${price:.2f}가 현재가 대비 {deviation_atr} ATR 이탈 (허용 {max_atr_multiple} ATR). ${corrected:.2f}로 보정 권고.",
+            "deviation_atr": deviation_atr
+        }
+
+    # 검증 2: Stop Loss가 Entry보다 높은 경우 (롱 기준)
+    # → 이건 validate_swing_plan에서 교차 검증
+
+    return {
+        "valid": True,
+        "original": price,
+        "corrected": None,
+        "warning": None,
+        "deviation_atr": deviation_atr
+    }
+
+
+def validate_swing_plan(plan: dict, current_price: float, atr: float) -> dict:
+    """
+    GPT가 산출한 매매 플랜 전체의 정합성을 교차 검증.
+
+    검증 항목:
+    1. Entry/Target/Stop 각각의 ATR 범위 검증
+    2. Stop Loss < Entry < Target 순서 검증 (롱 기준)
+    3. R:R 비율이 실제 가격과 일치하는지 검증
+    4. Stop Loss가 너무 타이트하지 않은지 (최소 0.5 ATR)
+    5. Target이 너무 소극적이지 않은지 (최소 1.0 ATR)
+
+    Returns:
+        {
+            "is_valid": bool,          전체 합격 여부
+            "warnings": [str],         경고 메시지 리스트
+            "corrections": {           보정 제안
+                "Entry_Price": float or None,
+                "Target_Price": float or None,
+                "Stop_Loss": float or None
+            },
+            "actual_rr": str,          실제 계산된 R:R
+            "price_checks": {          개별 가격 검증 결과
+                "entry": dict,
+                "target": dict,
+                "stop": dict
+            }
+        }
+    """
+    warnings = []
+    corrections = {"Entry_Price": None, "Target_Price": None, "Stop_Loss": None}
+
+    entry = safe_float(plan.get("Entry_Price"))
+    target = safe_float(plan.get("Target_Price"))
+    stop = safe_float(plan.get("Stop_Loss"))
+
+    # 개별 가격 ATR 범위 검증
+    entry_check = validate_gpt_price("진입가(Entry)", entry, current_price, atr, max_atr_multiple=3.0)
+    target_check = validate_gpt_price("목표가(Target)", target, current_price, atr, max_atr_multiple=7.0)
+    stop_check = validate_gpt_price("손절가(Stop)", stop, current_price, atr, max_atr_multiple=5.0)
+
+    for check in [entry_check, target_check, stop_check]:
+        if not check["valid"] and check["warning"]:
+            warnings.append(check["warning"])
+
+    if entry_check["corrected"]:
+        corrections["Entry_Price"] = entry_check["corrected"]
+    if target_check["corrected"]:
+        corrections["Target_Price"] = target_check["corrected"]
+    if stop_check["corrected"]:
+        corrections["Stop_Loss"] = stop_check["corrected"]
+
+    # 유효한 가격이 있을 때만 교차 검증
+    actual_rr = "N/A"
+    if entry and target and stop:
+
+        # 순서 검증: Stop < Entry < Target (롱 기준)
+        if stop >= entry:
+            warnings.append(f"⚠️ 구조 오류: 손절가(${stop:.2f}) ≥ 진입가(${entry:.2f}). 롱 포지션 기준 손절가는 진입가보다 낮아야 합니다.")
+            # 보정: 진입가에서 1.5 ATR 아래로 설정
+            corrected_stop = round(entry - (atr * 1.5), 2)
+            corrections["Stop_Loss"] = corrected_stop
+            warnings.append(f"   → 보정 제안: 손절가 ${corrected_stop:.2f} (진입가 - 1.5 ATR)")
+
+        if target <= entry:
+            warnings.append(f"⚠️ 구조 오류: 목표가(${target:.2f}) ≤ 진입가(${entry:.2f}). 롱 기준 목표가는 진입가보다 높아야 합니다.")
+            corrected_target = round(entry + (atr * 3.0), 2)
+            corrections["Target_Price"] = corrected_target
+            warnings.append(f"   → 보정 제안: 목표가 ${corrected_target:.2f} (진입가 + 3.0 ATR)")
+
+        # Stop이 너무 타이트한지 (0.5 ATR 미만)
+        if entry > stop:
+            stop_distance_atr = (entry - stop) / atr
+            if stop_distance_atr < 0.5:
+                warnings.append(f"⚠️ 손절 과소: 손절 거리가 {stop_distance_atr:.1f} ATR로 너무 타이트합니다. 정상 변동성에 의한 조기 청산 위험. 최소 0.5 ATR 권고.")
+
+        # Target이 너무 소극적인지 (1.0 ATR 미만)
+        if target > entry:
+            target_distance_atr = (target - entry) / atr
+            if target_distance_atr < 1.0:
+                warnings.append(f"⚠️ 목표 과소: 목표 거리가 {target_distance_atr:.1f} ATR로 수수료 대비 수익이 미미합니다. 최소 1.0 ATR 권고.")
+
+        # 실제 R:R 계산
+        if entry > stop and target > entry:
+            risk = entry - stop
+            reward = target - entry
+            actual_rr_val = round(reward / risk, 1)
+            actual_rr = f"1:{actual_rr_val}"
+
+            # GPT가 명시한 R:R과 비교
+            gpt_rr = plan.get("Risk_Reward_Ratio", "")
+            if gpt_rr and actual_rr != gpt_rr:
+                warnings.append(f"ℹ️ R:R 불일치: GPT 명시 {gpt_rr} vs 실제 계산 {actual_rr}")
+
+    is_valid = len(warnings) == 0
+
+    return {
+        "is_valid": is_valid,
+        "warnings": warnings,
+        "corrections": corrections,
+        "actual_rr": actual_rr,
+        "price_checks": {
+            "entry": entry_check,
+            "target": target_check,
+            "stop": stop_check
+        }
+    }
 
 # ==========================================
 # [7] 재무 데이터 보강 및 스윙 지표 계산 함수
@@ -644,6 +1497,10 @@ with st.sidebar:
     st.caption("ㄴ 경제 뉴스 100건을 수집하여 AI가 탐욕/공포 심리를 분석함.")
     use_fred = st.checkbox("FRED 거시/신용/원자재 반영", value=True)
     st.caption("ㄴ 연방준비은행의 거시/미시 및 FAO 식량가격지수를 퀀트 로직에 반영함.")
+    use_ecos = st.checkbox("한국은행 ECOS 매크로 반영", value=True)
+    st.caption("ㄴ 한은 기준금리, CPI, M2, 경상수지, 산업생산 등 한국 매크로 데이터를 수집하여 듀얼 레짐 분석에 반영함.")
+    use_macro_regime = st.checkbox("매크로 레짐 판별 (statsmodels)", value=True)
+    st.caption("ㄴ FRED 핵심 5개 지표를 종합하여 Risk-On/Neutral/Risk-Off 레짐을 자동 판별하고 전략 가중치에 반영함.")
     use_vix_dix = st.checkbox("공포/탐욕 및 기관 동향 (VIX/DIX)", value=True)
     st.caption("ㄴ CNN Fear & Greed Index와 다크풀 장외 매집 동향(DIX)을 진단함.")
     use_nlp = st.checkbox("기업 텍스트(뉴스) 마이닝 반영", value=True)
@@ -702,11 +1559,45 @@ with tab_dash:
             with st.spinner("데이터 수집 및 빅데이터 융합 분석 중..."):
                 try:
                     client = OpenAI(api_key=OPENAI_API_KEY)
-                    fred_snap, vix_snap, fg_snap, dix_snap, news_snap, fused_signals, nlp_snap = {}, {}, {}, {}, {}, {}, {}
+                    fred_snap, vix_snap, fg_snap, dix_snap, news_snap, fused_signals, nlp_snap, macro_regime_snap, ecos_snap, kr_regime_snap, dual_macro_snap = {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
                     
                     if use_fred: 
                         fred_snap = {"series": {g: {l: summarize_fred_latest(fetch_fred_series(s), s) for l, s in items.items()} for g, items in FRED_SERIES.items()}}
                     
+                    macro_regime_snap = {}
+                    if use_macro_regime:
+                        regime_result = compute_macro_regime()
+                        strategy_weights = get_regime_strategy_weights(regime_result)
+                        macro_regime_snap = {
+                            "regime": regime_result["regime"],
+                            "score": regime_result["score"],
+                            "signals": regime_result["signals"],
+                            "strategy_weights": strategy_weights,
+                            "summary": regime_result["summary"]
+                        }
+
+                    ecos_snap = {}
+                    kr_regime_snap = {}
+                    dual_macro_snap = {}
+                    if use_ecos:
+                        ecos_snap = {
+                            "series": {
+                                group: {
+                                    label: summarize_ecos_latest(
+                                        fetch_ecos_series(
+                                            info["stat_code"],
+                                            info["item_code"],
+                                            info["cycle"]
+                                        )
+                                    )
+                                    for label, info in items.items()
+                                }
+                                for group, items in ECOS_SERIES.items()
+                            }
+                        }
+                        kr_regime_snap = compute_kr_macro_regime()
+                        dual_macro_snap = compute_dual_macro_comparison()
+
                     if use_vix_dix:
                         vix_snap = summarize_fred_latest(fetch_fred_series("VIXCLS", years=1), "VIXCLS")
                         fg_snap = fetch_cnn_fear_and_greed()
@@ -731,13 +1622,59 @@ with tab_dash:
                         else:
                             fused_signals = run_fused_batch_scan(target_us, target_kr, current_fear)
 
-                    report = run_main_reco_engine(client, indices_data, active_exotics, fred_snap, vix_snap, fg_snap, dix_snap, news_snap, fused_signals, nlp_snap)
+                    report = run_main_reco_engine(
+                        client, indices_data, active_exotics,
+                        fred_snap, vix_snap, fg_snap, dix_snap,
+                        news_snap, fused_signals, nlp_snap,
+                        macro_regime_snap, ecos_snap, kr_regime_snap, dual_macro_snap
+                    )
                     report = enrich_report_with_fundamentals(report)
 
                     score = int(report.get("Stability_Score", 50))
                     status_text, status_color = score_to_status(score)
                     fig = go.Figure(go.Indicator(mode="gauge+number", value=score, title={"text": f"심리 상태: {status_text}", "font": {"color": status_color, "size": 24}}, gauge={"axis": {"range": [0, 100]}, "bar": {"color": "white"}, "steps": [{"range": [0, 60], "color": "#FF4B4B"}, {"range": [60, 80], "color": "#FFA500"}, {"range": [80, 100], "color": "#00CC96"}]}))
                     st.plotly_chart(fig, use_container_width=True)
+                    
+                    if macro_regime_snap:
+                        st.divider()
+                        st.subheader("🌐 매크로 레짐 판별 결과")
+                        regime = macro_regime_snap["regime"]
+                        r_score = macro_regime_snap["score"]
+                        r_color = "#00CC96" if regime == "Risk-On" else "#FF4B4B" if regime == "Risk-Off" else "#FFA500"
+
+                        rc1, rc2, rc3 = st.columns(3)
+                        rc1.metric("현재 레짐", regime)
+                        rc2.metric("레짐 점수", f"{r_score}/100")
+                        rc3.metric("전략 편향", macro_regime_snap.get("strategy_weights", {}).get("strategy_bias", "N/A"))
+
+                        with st.expander("📋 개별 지표 판정 상세", expanded=False):
+                            for ind_key, ind_val in macro_regime_snap.get("signals", {}).items():
+                                st.write(f"**{ind_key}:** {ind_val['value']} → {ind_val['signal']}")
+
+                        weights = macro_regime_snap.get("strategy_weights", {})
+                        st.info(f"💡 **레짐 기반 전략 가이드:** {weights.get('regime_note', '')}")
+                        st.caption(f"포지션 배율: x{weights.get('position_size_multiplier', 1.0)} | 스탑 ATR 배수: {weights.get('stop_loss_atr_multiplier', 1.5)} | 최대 리스크: {weights.get('max_risk_pct', 2.0)}%")
+                        st.divider()
+
+                    if dual_macro_snap:
+                        st.subheader("🌏 한미 듀얼 매크로 비교")
+
+                        dc1, dc2, dc3 = st.columns(3)
+                        us_color = "#00CC96" if dual_macro_snap["us_regime"] == "Risk-On" else "#FF4B4B" if dual_macro_snap["us_regime"] == "Risk-Off" else "#FFA500"
+                        kr_color = "#00CC96" if dual_macro_snap["kr_regime"] == "Risk-On" else "#FF4B4B" if dual_macro_snap["kr_regime"] == "Risk-Off" else "#FFA500"
+
+                        dc1.metric("🇺🇸 미국 레짐", f"{dual_macro_snap['us_regime']} ({dual_macro_snap['us_score']}점)")
+                        dc2.metric("🇰🇷 한국 레짐", f"{dual_macro_snap['kr_regime']} ({dual_macro_snap['kr_score']}점)")
+                        dc3.metric("크로스마켓 시그널", dual_macro_snap["cross_signal"])
+
+                        if dual_macro_snap.get("rate_note"):
+                            st.caption(dual_macro_snap["rate_note"])
+
+                        with st.expander("📋 한국 매크로 개별 지표 상세", expanded=False):
+                            for ind_key, ind_val in dual_macro_snap.get("kr_signals", {}).items():
+                                st.write(f"**{ind_key}:** {ind_val['value']} → {ind_val['signal']}")
+
+                        st.divider()
 
                     st.subheader("분석 근거 및 전략")
                     st.info(report.get("Logic", "분석 결과 없음"))
@@ -793,6 +1730,93 @@ with tab_econ:
         f_id = FRED_SERIES["물가/원자재(Commodity)"][f_label]
         st.line_chart(fetch_fred_series(f_id, years=10).set_index("DATE")[f_id])
         st.info(FRED_DESC.get(f_id, ""))
+
+    st.divider()
+    st.header("🇰🇷 한국은행 ECOS 매크로 지표")
+    st.caption("한국은행 경제통계시스템(ECOS)에서 직접 수집한 한국 핵심 매크로 데이터입니다. 위의 FRED 미국 지표와 대비하여 분석하세요.")
+
+    ecos_row1_c1, ecos_row1_c2 = st.columns(2)
+    ecos_row2_c1, ecos_row2_c2 = st.columns(2)
+
+    with ecos_row1_c1:
+        st.subheader("금리(Interest)")
+        kr_rate_label = st.selectbox("한국 금리 지표 선택", list(ECOS_SERIES["금리(Interest)"].keys()))
+        kr_rate_info = ECOS_SERIES["금리(Interest)"][kr_rate_label]
+        df_kr_rate = fetch_ecos_series(kr_rate_info["stat_code"], kr_rate_info["item_code"], kr_rate_info["cycle"], years=10)
+        if not df_kr_rate.empty:
+            st.line_chart(df_kr_rate.set_index("DATE")["VALUE"])
+        else:
+            st.warning("데이터 수집 실패. ECOS API 키를 확인하세요.")
+        st.info(ECOS_DESC.get(kr_rate_label, ""))
+
+    with ecos_row1_c2:
+        st.subheader("물가(Price)")
+        kr_price_label = st.selectbox("한국 물가 지표 선택", list(ECOS_SERIES["물가(Price)"].keys()))
+        kr_price_info = ECOS_SERIES["물가(Price)"][kr_price_label]
+        df_kr_price = fetch_ecos_series(kr_price_info["stat_code"], kr_price_info["item_code"], kr_price_info["cycle"], years=10)
+        if not df_kr_price.empty:
+            st.line_chart(df_kr_price.set_index("DATE")["VALUE"])
+        else:
+            st.warning("데이터 수집 실패.")
+        st.info(ECOS_DESC.get(kr_price_label, ""))
+
+    with ecos_row2_c1:
+        st.subheader("통화(Money)")
+        kr_money_label = st.selectbox("한국 통화 지표 선택", list(ECOS_SERIES["통화(Money)"].keys()))
+        kr_money_info = ECOS_SERIES["통화(Money)"][kr_money_label]
+        df_kr_money = fetch_ecos_series(kr_money_info["stat_code"], kr_money_info["item_code"], kr_money_info["cycle"], years=10)
+        if not df_kr_money.empty:
+            st.line_chart(df_kr_money.set_index("DATE")["VALUE"])
+        else:
+            st.warning("데이터 수집 실패.")
+        st.info(ECOS_DESC.get(kr_money_label, ""))
+
+    with ecos_row2_c2:
+        st.subheader("실물(Real)")
+        kr_real_label = st.selectbox("한국 실물 지표 선택", list(ECOS_SERIES["실물(Real)"].keys()))
+        kr_real_info = ECOS_SERIES["실물(Real)"][kr_real_label]
+        df_kr_real = fetch_ecos_series(kr_real_info["stat_code"], kr_real_info["item_code"], kr_real_info["cycle"], years=10)
+        if not df_kr_real.empty:
+            st.line_chart(df_kr_real.set_index("DATE")["VALUE"])
+        else:
+            st.warning("데이터 수집 실패.")
+        st.info(ECOS_DESC.get(kr_real_label, ""))
+
+    st.divider()
+    st.subheader("🔬 매크로 지표 → 시장 수익률 인과관계 검정 (Granger Causality)")
+    st.caption("FRED 매크로 지표가 S&P 500 수익률을 통계적으로 선행 예측하는지 검증합니다. (월간 데이터, 최대 6개월 시차)")
+
+    granger_targets = {
+        "장단기 금리차 (T10Y2Y)": "T10Y2Y",
+        "금융스트레스지수 (STLFSI4)": "STLFSI4",
+        "삼 법칙 (SAHMREALTIME)": "SAHMREALTIME",
+        "하이일드 스프레드 (BAMLH0A0HYM2)": "BAMLH0A0HYM2",
+        "실업률 (UNRATE)": "UNRATE"
+    }
+
+    if st.button("인과관계 검정 실행", key="btn_granger"):
+        with st.spinner("그레인저 인과관계 검정 수행 중... (약 15~30초 소요)"):
+            granger_results = []
+            for label, series_id in granger_targets.items():
+                res = run_granger_causality(series_id, "^GSPC", max_lag=6)
+                granger_results.append({
+                    "지표": label,
+                    "인과관계": "✅ 유의미" if res["has_causality"] else "❌ 미유의",
+                    "최적 시차": f"{res['best_lag']}개월",
+                    "p-value": f"{res['p_value']:.4f}",
+                    "해석": res["direction"] if res["has_causality"] else "통계적 선행 관계 없음"
+                })
+
+            df_granger = pd.DataFrame(granger_results)
+            st.dataframe(df_granger, use_container_width=True, hide_index=True)
+
+            causal_count = sum(1 for r in granger_results if "유의미" in r["인과관계"])
+            if causal_count >= 3:
+                st.success(f"💡 5개 중 {causal_count}개 지표가 시장 수익률에 대해 통계적 선행 관계를 보입니다. 매크로 레짐 판별의 신뢰도가 높은 상태입니다.")
+            elif causal_count >= 1:
+                st.info(f"💡 {causal_count}개 지표만 유의미한 선행 관계를 보입니다. 매크로 신호를 보조 지표로 활용하세요.")
+            else:
+                st.warning("현재 시점에서 매크로 지표의 시장 선행력이 통계적으로 약합니다. 기술적 지표 중심으로 판단하세요.")
 
 with tab_vix_fg:
     st.header("😱 공포/탐욕 지수 및 기관 동향 (VIX/FG/DIX)")
@@ -984,12 +2008,12 @@ with tab_insider:
 with tab_swing:
     st.header("🏄‍♂️ 스윙매매 전략 어시스턴트 (백테스트 & PCR 융합)")
     st.markdown("단기~중기 기술적 지표, 과거 백테스트 승률 산출, Put/Call Ratio를 융합하여 기계적인 진입/청산 시나리오를 자동 산출합니다.")
-    
+
     col1, col2, col3 = st.columns(3)
     swing_ticker = col1.text_input("티커 입력 (예: TSLA, 005930)", value="TSLA", key="swing_tkr").upper()
     total_capital = col2.number_input("총 투자금 ($ 또는 원)", value=10000, step=1000)
     risk_pct = col3.number_input("1회 감수 리스크 (%)", value=2.0, step=0.5, max_value=10.0)
-    
+
     if st.button("스윙 전략 산출", type="primary", key="btn_swing"):
         with st.spinner(f"{swing_ticker} 데이터 스캔, 백테스팅 및 AI 추론 중..."):
             df = fetch_ohlcv(swing_ticker, days=1200)
@@ -997,60 +2021,149 @@ with tab_swing:
                 st.error("종목 데이터를 불러오지 못했습니다. 티커를 확인하세요.")
             else:
                 df = calculate_technicals(df)
-                
+
                 c_prc = float(df['Close'].iloc[-1])
                 c_atr = float(df['ATR'].iloc[-1])
                 c_rsi = float(df['RSI'].iloc[-1])
                 c_poc = float(df['POC'].iloc[-1])
                 sqz = bool(df['Squeeze_On'].iloc[-1])
-                
+
                 pcr_val = fetch_put_call_ratio()
                 pcr_val = float(pcr_val) if pcr_val is not None else None
+
+                # ── 강화된 백테스트 실행 ──
                 bt_stats = run_quick_backtest(df)
                 bt_stats_wr = float(bt_stats['win_rate'])
-                
+
                 news_res = fetch_naver_news_bulk(f"미국 증시 {swing_ticker}", NAVER_CLIENT_ID, NAVER_CLIENT_SECRET, display=15)
-                
+
+                # ── 캔들스틱 차트 ──
                 st.subheader(f"{swing_ticker} 캔들스틱 및 기술적 지표 (최근 90일)")
                 plot_df = df.tail(90)
                 fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3], vertical_spacing=0.05)
-                
+
                 fig.add_trace(go.Candlestick(x=plot_df['Date'], open=plot_df['Open'], high=plot_df['High'], low=plot_df['Low'], close=plot_df['Close'], name="Price"), row=1, col=1)
                 fig.add_trace(go.Scatter(x=plot_df['Date'], y=plot_df['BB_High'], line=dict(color='gray', width=1, dash='dot'), name="BB High"), row=1, col=1)
                 fig.add_trace(go.Scatter(x=plot_df['Date'], y=plot_df['BB_Low'], line=dict(color='gray', width=1, dash='dot'), name="BB Low"), row=1, col=1)
-                
+
                 fig.add_trace(go.Bar(x=plot_df['Date'], y=plot_df['Volume'], name="Volume", marker_color='rgba(0, 204, 150, 0.5)'), row=2, col=1)
                 fig.update_layout(height=500, xaxis_rangeslider_visible=False, margin=dict(l=0, r=0, t=30, b=0))
                 st.plotly_chart(fig, use_container_width=True)
-                
+
+                # ── 기본 메트릭 Row 1 ──
                 c_a, c_b, c_c, c_d = st.columns(4)
                 c_a.metric("현재가", f"{c_prc:,.2f}")
                 c_b.metric("RSI (14일)", f"{c_rsi:.1f}", "과매도" if c_rsi < 30 else "과매수" if c_rsi > 70 else "중립")
-                
+
                 bt_text = f"{bt_stats_wr:.1f}%" if bt_stats['total_trades'] > 0 else "데이터 부족"
                 c_c.metric("과거 유사조건 승률", bt_text)
-                
+
                 pcr_text = f"{pcr_val:.2f}" if pcr_val else "데이터 없음"
                 c_d.metric("Put/Call Ratio", pcr_text, "역발상 매수 기회" if pcr_val and pcr_val >= 1.2 else "")
-                
+
+                # ── 강화 메트릭 Row 2 (신규) ──
+                if bt_stats['total_trades'] > 0:
+                    c_e, c_f, c_g, c_h = st.columns(4)
+                    c_e.metric("Sharpe Ratio", f"{bt_stats['sharpe_ratio']:.2f}",
+                               "양호" if bt_stats['sharpe_ratio'] > 1.0 else "보통" if bt_stats['sharpe_ratio'] > 0 else "불량")
+                    c_f.metric("최대 낙폭 (MDD)", f"{bt_stats['max_drawdown']:.1f}%",
+                               "위험" if bt_stats['max_drawdown'] < -30 else "")
+                    c_g.metric("총 수익률", f"{bt_stats['total_return']:.1f}%")
+                    c_h.metric("Profit Factor", f"{bt_stats['profit_factor']:.2f}",
+                               "유효" if bt_stats['profit_factor'] > 1.5 else "")
+
+                # ── Equity Curve 차트 (신규) ──
+                if bt_stats['total_trades'] > 0 and not bt_stats['equity_curve'].empty:
+                    st.subheader("📈 백테스트 자산 곡선 (Equity Curve)")
+                    fig_eq = go.Figure()
+                    fig_eq.add_trace(go.Scatter(
+                        x=bt_stats['equity_curve'].index,
+                        y=bt_stats['equity_curve'].values,
+                        mode='lines',
+                        name='Portfolio Value',
+                        line=dict(color='#00CC96', width=2)
+                    ))
+                    fig_eq.add_hline(y=10000, line_dash="dash", line_color="gray",
+                                    annotation_text="초기 자본 $10,000")
+                    fig_eq.update_layout(
+                        height=300,
+                        margin=dict(l=0, r=0, t=30, b=0),
+                        yaxis_title="포트폴리오 가치 ($)",
+                        xaxis_title=""
+                    )
+                    st.plotly_chart(fig_eq, use_container_width=True)
+
+                # ── quantstats HTML 리포트 다운로드 (신규) ──
+                if bt_stats['total_trades'] > 0 and not bt_stats['equity_curve'].empty:
+                    try:
+                        returns = bt_stats['equity_curve'].pct_change().dropna()
+                        qs_html = qs.reports.html(returns, output=None, title=f"{swing_ticker} Backtest Report")
+                        if qs_html:
+                            st.download_button(
+                                label="📊 상세 백테스트 리포트 다운로드 (HTML)",
+                                data=qs_html,
+                                file_name=f"{swing_ticker}_backtest_report.html",
+                                mime="text/html"
+                            )
+                    except Exception:
+                        pass  # quantstats 리포트 생성 실패 시 무시
+
+                # ── RSI 파라미터 최적화 (신규 섹션) ──
+                with st.expander("🔬 RSI 파라미터 최적화 (Grid Search)", expanded=False):
+                    st.caption("RSI 진입/청산 임계값 조합을 탐색하여 해당 종목에 최적화된 파라미터를 산출합니다.")
+                    if st.button("최적화 실행", key="btn_grid"):
+                        with st.spinner("파라미터 그리드 서치 중... (약 10~30초 소요)"):
+                            grid = run_rsi_grid_search(df)
+                            if not grid['heatmap_df'].empty:
+                                st.success(f"**최적 파라미터:** RSI 진입 < {grid['best_entry']} / 청산 > {grid['best_exit']} (Sharpe: {grid['best_sharpe']:.2f})")
+
+                                fig_hm = go.Figure(data=go.Heatmap(
+                                    z=grid['heatmap_df'].values,
+                                    x=[str(c) for c in grid['heatmap_df'].columns],
+                                    y=[str(i) for i in grid['heatmap_df'].index],
+                                    colorscale='RdYlGn',
+                                    colorbar_title="Sharpe"
+                                ))
+                                fig_hm.update_layout(
+                                    title="RSI 파라미터 조합별 Sharpe Ratio",
+                                    xaxis_title="RSI 청산 임계값",
+                                    yaxis_title="RSI 진입 임계값",
+                                    height=400
+                                )
+                                st.plotly_chart(fig_hm, use_container_width=True)
+                            else:
+                                st.warning("유효한 트레이드가 부족하여 최적화를 수행할 수 없습니다.")
+
+                # ── 기술적 서머리 (AI 전달용) ──
                 tech_summary = {
-                    "RSI": c_rsi, "ATR": c_atr, 
-                    "POC_Level": c_poc, 
+                    "RSI": c_rsi, "ATR": c_atr,
+                    "POC_Level": c_poc,
                     "Squeeze_Active": sqz,
                     "Historical_Win_Rate": bt_stats_wr,
-                    "Put_Call_Ratio": pcr_val
+                    "Put_Call_Ratio": pcr_val,
+                    "Sharpe_Ratio": bt_stats['sharpe_ratio'],
+                    "Max_Drawdown_Pct": bt_stats['max_drawdown'],
+                    "Total_Return_Pct": bt_stats['total_return'],
+                    "Profit_Factor": bt_stats['profit_factor'],
+                    "Total_Backtest_Trades": bt_stats['total_trades'],
+                    "Macro_Regime": compute_macro_regime().get("regime", "Neutral"),
+                    "Macro_Score": compute_macro_regime().get("score", 50),
+                    "Macro_Strategy_Note": get_regime_strategy_weights(compute_macro_regime()).get("regime_note", ""),
+                    "KR_Macro_Regime": compute_kr_macro_regime().get("regime", "Neutral"),
+                    "KR_Macro_Score": compute_kr_macro_regime().get("score", 50),
+                    "Dual_Market_Signal": compute_dual_macro_comparison().get("cross_signal", "균형"),
                 }
-                
+
                 if not OPENAI_API_KEY or OPENAI_API_KEY == "YOUR_OPENAI_API_KEY":
                     st.warning("OpenAI API 키가 설정되지 않아 AI 시나리오를 산출할 수 없습니다.")
                 else:
                     client = OpenAI(api_key=OPENAI_API_KEY)
                     swing_plan = generate_swing_scenarios(client, swing_ticker, c_prc, tech_summary, news_res.get("items", []))
-                    
+
                     st.divider()
                     st.subheader("🧠 시스템 산출 매매 시나리오 및 리스크 관리")
                     st.info(f"**현재 국면 진단:** {swing_plan.get('Analysis', '')}")
-                    
+
                     pc1, pc2 = st.columns(2)
                     with pc1:
                         plan_a = swing_plan.get("Plan_A", {})
@@ -1060,13 +2173,36 @@ with tab_swing:
                             st.write(f"**진입가:** {plan_a.get('Entry_Price')} / **목표가:** {plan_a.get('Target_Price')}")
                             st.write(f"**손절가:** {plan_a.get('Stop_Loss')} (R:R = {plan_a.get('Risk_Reward_Ratio')})")
                             st.caption(f"논리: {plan_a.get('Reason')}")
-                            
+
+                            validation_a = validate_swing_plan(plan_a, c_prc, c_atr)
+
+                            if not validation_a["is_valid"]:
+                                st.warning("⚠️ **AI 산출 가격 검증 결과: 이상 감지**")
+                                for w in validation_a["warnings"]:
+                                    st.caption(w)
+
+                                corr = validation_a["corrections"]
+                                has_correction = any(v is not None for v in corr.values())
+                                if has_correction:
+                                    corr_parts = []
+                                    if corr["Entry_Price"]:
+                                        corr_parts.append(f"진입가 ${corr['Entry_Price']:.2f}")
+                                    if corr["Target_Price"]:
+                                        corr_parts.append(f"목표가 ${corr['Target_Price']:.2f}")
+                                    if corr["Stop_Loss"]:
+                                        corr_parts.append(f"손절가 ${corr['Stop_Loss']:.2f}")
+                                    st.info(f"🔧 **보정 제안:** {' / '.join(corr_parts)}")
+                            else:
+                                st.success(f"✅ AI 산출 가격 검증 통과 (실제 R:R = {validation_a['actual_rr']})")
+
                             entry_a = safe_float(plan_a.get('Entry_Price'))
                             stop_a = safe_float(plan_a.get('Stop_Loss'))
                             if entry_a and stop_a and entry_a > stop_a:
-                                risk_amount = total_capital * (risk_pct / 100)
+                                regime_weights = get_regime_strategy_weights(compute_macro_regime())
+                                adjusted_risk_pct = min(risk_pct, regime_weights["max_risk_pct"])
+                                risk_amount = total_capital * (adjusted_risk_pct / 100) * regime_weights["position_size_multiplier"]
                                 shares = risk_amount / (entry_a - stop_a)
-                                st.success(f"💡 **포지션 사이즈 계산:** 목표 리스크({risk_amount})에 맞춘 적정 매수 수량은 **{int(shares)}주** 입니다.")
+                                st.success(f"💡 **포지션 사이즈 계산 (레짐 반영):** ...")
 
                     with pc2:
                         plan_b = swing_plan.get("Plan_B", {})
@@ -1076,13 +2212,64 @@ with tab_swing:
                             st.write(f"**진입가:** {plan_b.get('Entry_Price')} / **목표가:** {plan_b.get('Target_Price')}")
                             st.write(f"**손절가:** {plan_b.get('Stop_Loss')} (R:R = {plan_b.get('Risk_Reward_Ratio')})")
                             st.caption(f"논리: {plan_b.get('Reason')}")
-                            
+
+                            validation_b = validate_swing_plan(plan_b, c_prc, c_atr)
+
+                            if not validation_b["is_valid"]:
+                                st.warning("⚠️ **AI 산출 가격 검증 결과: 이상 감지**")
+                                for w in validation_b["warnings"]:
+                                    st.caption(w)
+
+                                corr = validation_b["corrections"]
+                                has_correction = any(v is not None for v in corr.values())
+                                if has_correction:
+                                    corr_parts = []
+                                    if corr["Entry_Price"]:
+                                        corr_parts.append(f"진입가 ${corr['Entry_Price']:.2f}")
+                                    if corr["Target_Price"]:
+                                        corr_parts.append(f"목표가 ${corr['Target_Price']:.2f}")
+                                    if corr["Stop_Loss"]:
+                                        corr_parts.append(f"손절가 ${corr['Stop_Loss']:.2f}")
+                                    st.info(f"🔧 **보정 제안:** {' / '.join(corr_parts)}")
+                            else:
+                                st.success(f"✅ AI 산출 가격 검증 통과 (실제 R:R = {validation_b['actual_rr']})")
+
                             entry_b = safe_float(plan_b.get('Entry_Price'))
                             stop_b = safe_float(plan_b.get('Stop_Loss'))
                             if entry_b and stop_b and entry_b > stop_b:
-                                risk_amount = total_capital * (risk_pct / 100)
+                                regime_weights = get_regime_strategy_weights(compute_macro_regime())
+                                adjusted_risk_pct = min(risk_pct, regime_weights["max_risk_pct"])
+                                risk_amount = total_capital * (adjusted_risk_pct / 100) * regime_weights["position_size_multiplier"]
                                 shares = risk_amount / (entry_b - stop_b)
-                                st.success(f"💡 **포지션 사이즈 계산:** 목표 리스크({risk_amount})에 맞춘 적정 매수 수량은 **{int(shares)}주** 입니다.")
+                                st.success(f"💡 **포지션 사이즈 계산 (레짐 반영):** ...")
+
+                    st.divider()
+                    with st.expander("🔍 AI 산출 가격 검증 상세 리포트", expanded=False):
+                        st.caption("GPT가 산출한 모든 가격을 현재가 대비 ATR 거리, 구조적 정합성, R:R 일치 여부로 교차 검증한 결과입니다.")
+
+                        for plan_name, validation in [("Plan A", validation_a), ("Plan B", validation_b)]:
+                            st.markdown(f"**{plan_name}:**")
+                            checks = validation["price_checks"]
+
+                            v_data = []
+                            for price_type, check in [("진입가", checks["entry"]), ("목표가", checks["target"]), ("손절가", checks["stop"])]:
+                                v_data.append({
+                                    "항목": price_type,
+                                    "GPT 산출가": f"${check['original']:.2f}" if check['original'] else "N/A",
+                                    "현재가 대비": f"{check['deviation_atr']} ATR",
+                                    "판정": "✅ 정상" if check['valid'] else "⚠️ 이상",
+                                    "보정 제안": f"${check['corrected']:.2f}" if check['corrected'] else "-"
+                                })
+
+                            st.dataframe(pd.DataFrame(v_data), use_container_width=True, hide_index=True)
+                            st.caption(f"실제 R:R = {validation['actual_rr']}")
+                            st.write("---")
+
+                        total_warnings = len(validation_a["warnings"]) + len(validation_b["warnings"])
+                        if total_warnings == 0:
+                            st.success("🎯 모든 AI 산출 가격이 ATR 기반 합리성 검증을 통과했습니다.")
+                        else:
+                            st.warning(f"총 {total_warnings}건의 가격 이상이 감지되었습니다. 보정 제안을 참고하여 수동 조정하세요.")
 
 with tab_briefing:
     st.header("📝 장 전/장 마감 브리핑 및 관심 종목 10선")
@@ -1136,5 +2323,8 @@ with tab_briefing:
                                 with st.expander(f"{idx+1}. {stock.get('Name')} ({stock.get('Ticker')})"):
                                     st.write(f"**선정 사유:** {stock.get('Reason')}")
                                     
+                except Exception as e:
+                    st.error(f"브리핑 생성 중 오류 발생: {str(e)}")
+
                 except Exception as e:
                     st.error(f"브리핑 생성 중 오류 발생: {str(e)}")
