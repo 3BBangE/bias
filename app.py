@@ -1161,7 +1161,7 @@ def analyze_news_with_gpt(client: OpenAI, news_items: list):
     prompt = """시장 심리 분석 AI임. 반드시 JSON 형식 응답.
 [JSON Schema]
 {"Sentiment_Score": 0~100, "Market_Mood": "안정/주의/경고", "Key_Themes": ["키워드1"], "Summary": "요약", "Hot_Stocks": [{"Name": "종목", "Ticker": "티커", "Reason": "근거", "News_Link": "URL"}]}"""
-    res = client.chat.completions.create(model="gpt-5.4", messages=[{"role": "system", "content": prompt}, {"role": "user", "content": f"데이터: {json.dumps(top_news, ensure_ascii=False)}"}], response_format={"type": "json_object"})
+    res = client.chat.completions.create(model="gpt-5.4-mini", messages=[{"role": "system", "content": prompt}, {"role": "user", "content": f"데이터: {json.dumps(top_news, ensure_ascii=False)}"}], response_format={"type": "json_object"})
     return json.loads(res.choices[0].message.content)
 
 def run_main_reco_engine(client, indices_data: dict, active_exotics: list,
@@ -1203,7 +1203,7 @@ def run_main_reco_engine(client, indices_data: dict, active_exotics: list,
         "kr_macro_regime": kr_regime_snapshot if kr_regime_snapshot else {},
         "dual_macro": dual_macro_snapshot if dual_macro_snapshot else {}
     }
-    res = client.chat.completions.create(model="gpt-5.4", messages=[{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}], response_format={"type": "json_object"})
+    res = client.chat.completions.create(model="gpt-5.4-mini", messages=[{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}], response_format={"type": "json_object"})
     return json.loads(res.choices[0].message.content)
 
 def generate_market_briefing(client: OpenAI, market: str, session: str, news_items: list, macro_snap: dict):
@@ -1215,7 +1215,7 @@ def generate_market_briefing(client: OpenAI, market: str, session: str, news_ite
     top_news = get_top_k_news_rag(client, context_query, news_items, k=20)
     optimized_news = [{"Title": item.get("title"), "Link": item.get("link")} for item in top_news]
     
-    res = client.chat.completions.create(model="gpt-5.4", messages=[{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps({"Macro": macro_snap, "News": optimized_news}, ensure_ascii=False)}], response_format={"type": "json_object"})
+    res = client.chat.completions.create(model="gpt-5.4-mini", messages=[{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps({"Macro": macro_snap, "News": optimized_news}, ensure_ascii=False)}], response_format={"type": "json_object"})
     return json.loads(res.choices[0].message.content)
 
 def generate_swing_scenarios(client: OpenAI, ticker: str, current_price: float, tech_summary: dict, news_data: list):
@@ -1242,7 +1242,7 @@ def generate_swing_scenarios(client: OpenAI, ticker: str, current_price: float, 
     top_news = get_top_k_news_rag(client, context_query, news_data, k=10)
 
     payload = {"Ticker": ticker, "Current_Price": current_price, "Technical_Indicators": tech_summary, "Recent_News": top_news}
-    res = client.chat.completions.create(model="gpt-5.4", messages=[{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}], response_format={"type": "json_object"})
+    res = client.chat.completions.create(model="gpt-5.4-mini", messages=[{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}], response_format={"type": "json_object"})
     return json.loads(res.choices[0].message.content)
 
 def validate_gpt_price(label: str, price: float, current_price: float, atr: float,
